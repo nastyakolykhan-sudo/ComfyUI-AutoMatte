@@ -19,6 +19,7 @@ No model weights, only torch, so nothing here carries a model licence.
 """
 
 import json
+import re
 import math
 
 import torch
@@ -339,21 +340,90 @@ class AutoMatteToRGBA:
         return (torch.cat([images[..., :3], m[:n, ..., None].clamp(0, 1)], -1).contiguous(),)
 
 
+class AutoMatteCountPromptItems:
+    """Read a comma-separated prompt list with optional ':N' counts ("cake:2, apron, window panel:4") the way
+    text-prompted detectors such as SAM 3 read it (parentheses dropped, an item without a count = default_count)
+    and return the total, clamped to 1..max_total: e.g. for a tracker's max-objects setting. Also returns the clean
+    item list and a JSON block for the report (wire it to Save Report's `extra`). `source` (optional) says where the
+    text came from (e.g. typed / auto) and goes into the JSON."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": ("STRING", {"forceInput": True}),
+                "max_total": ("INT", {"default": 64, "min": 1, "max": 4096, "tooltip": "Upper limit for the total."}),
+                "default_count": ("INT", {"default": 1, "min": 1, "max": 4096, "tooltip": "Count for an item without ':N'."}),
+            },
+            "optional": {
+                "source": ("STRING", {"forceInput": True, "tooltip": "Where the text came from; copied into the JSON."}),
+            },
+        }
+
+    RETURN_TYPES = ("INT", "STRING", "STRING")
+    RETURN_NAMES = ("total", "items", "json")
+    FUNCTION = "run"
+    CATEGORY = "AutoMatte"
+
+    @staticmethod
+    def parse(text, default_count=1):
+        parts = [p.strip() for p in (text or "").replace("(", "").replace(")", "").split(",") if p.strip()]
+        out = []
+        for part in parts:
+            m = re.match(r"^(.+?)\s*:\s*([\d.]+)\s*$", part)
+            out.append((m.group(1).strip(), max(1, round(float(m.group(2))))) if m else (part, default_count))
+        return out
+
+    def run(self, text, max_total=64, default_count=1, source=None):
+        items = self.parse(text, default_count)
+        asked = sum(n for _, n in items) if items else default_count
+        total = int(min(max(asked, 1), max_total))
+        notes = []
+        if len(items) > 1 or any(n > 1 for _, n in items):
+            notes.append(f"Up to {total} objects are followed in total, shared by all subjects (not per subject)")
+        if asked > max_total:
+            notes.append(f"{asked} objects were asked for; capped at {max_total}")
+        info = {"subject_items": [{"text": t, "count": n} for t, n in items], "max_objects": total}
+        if source is not None:
+            info["subject_source"] = source
+        if notes:
+            info["notes"] = notes
+        return (total, ", ".join(t if n == default_count else f"{t}:{n}" for t, n in items), json.dumps(info))
+
+
 class AutoMatteSaveReport:
     """Write the Combine report as a JSON file in the output folder and return it as a file
-    output, so API runners (comfy deploy run, Brand Brain) download it with the images."""
+    output, so API runners (comfy deploy run, Brand Brain) download it with the images.
+    `extra` (optional JSON object) is merged in: its notes / review_reasons are appended, other keys are added
+    when the report doesn't have them."""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {"report": ("STRING", {"forceInput": True}),
-                             "filename_prefix": ("STRING", {"default": "automatte/report"})}}
+                             "filename_prefix": ("STRING", {"default": "automatte/report"})},
+                "optional": {"extra": ("STRING", {"forceInput": True, "tooltip": "JSON object merged into the report."})}}
 
     RETURN_TYPES = ()
     OUTPUT_NODE = True
     FUNCTION = "run"
     CATEGORY = "AutoMatte"
 
-    def run(self, report, filename_prefix):
+    @staticmethod
+    def merge(data, extra):
+        try:
+            more = json.loads(extra) if extra else {}
+        except Exception:
+            more = {"extra": extra}
+        if not isinstance(more, dict):
+            more = {"extra": more}
+        for k, v in more.items():
+            if k in ("notes", "review_reasons") and isinstance(v, list):
+                data[k] = list(data.get(k) or []) + v
+            elif k not in data:
+                data[k] = v
+        return data
+
+    def run(self, report, filename_prefix, extra=None):
         import os
         import folder_paths
 
@@ -361,6 +431,7 @@ class AutoMatteSaveReport:
             data = json.loads(report)
         except Exception:
             data = {"report": report}
+        data = self.merge(data, extra)
         out_dir = folder_paths.get_output_directory()
         folder, name = os.path.split(filename_prefix.strip().strip("/") or "report")
         full = os.path.join(out_dir, folder)
@@ -381,6 +452,7 @@ NODE_CLASS_MAPPINGS = {
     "AutoMatteRestore": AutoMatteRestore,
     "AutoMatteToRGBA": AutoMatteToRGBA,
     "AutoMatteSaveReport": AutoMatteSaveReport,
+    "AutoMatteCountPromptItems": AutoMatteCountPromptItems,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AutoMatteFit": "AutoMatte: Fit Frames",
@@ -388,4 +460,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AutoMatteRestore": "AutoMatte: Restore Size",
     "AutoMatteToRGBA": "AutoMatte: To RGBA",
     "AutoMatteSaveReport": "AutoMatte: Save Report",
+    "AutoMatteCountPromptItems": "AutoMatte: Count Prompt Items",
 }

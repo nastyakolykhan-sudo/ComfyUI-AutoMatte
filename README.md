@@ -11,7 +11,8 @@ and undo the fit. Model-agnostic: no model's limits in the logic, and every defa
 | AutoMatte: Combine Subject Mask + Soft Matte | Gates the soft matte to the subject mask. Measures the soft matte's opacity deep inside the subject over the whole clip: solid (≥ `solid_threshold`, 0.95) → keeps its soft edges; see-through on a solid object → fills the interior from the mask and rescales the edges. Soft matte missing the subject (interior below `min_interior`, 0.25) → the subject mask, lightly feathered. A subject missing for up to `hold_frames` (4) frames holds the nearest mask; longer absences (out of shot) come out empty. Optional `subject_text`: wired and empty = no subject named, the soft matte is used as is; typed but never found → needs review. |
 | AutoMatte: Restore Size | Drops the padded frames and pixels and scales back to the source size. |
 | AutoMatte: To RGBA | Source frames + matte → RGBA frames, straight alpha. |
-| AutoMatte: Save Report | Writes Combine's JSON report as a file output, so API runners download it with the images. |
+| AutoMatte: Save Report | Writes Combine's JSON report as a file output, so API runners download it with the images. Optional `extra` (JSON object) is merged in: its `notes` / `review_reasons` are appended, other keys added when missing. |
+| AutoMatte: Count Prompt Items | Reads a comma-separated prompt list with optional `:N` counts (`cake:2, apron, window panel:4`) the way text-prompted detectors such as SAM 3 do (parentheses dropped, no count = `default_count`, 1) and returns the total, clamped to 1..`max_total` (64), e.g. for a tracker's max-objects setting; plus the clean list and a JSON block for Save Report's `extra` (items, total, optional `source`, a note that the total is shared by all items). |
 
 `keep_transparency` (Combine) skips the interior repair, for subjects that really are see-through (glass, water, smoke).
 
