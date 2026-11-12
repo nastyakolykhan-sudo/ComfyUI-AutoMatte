@@ -305,7 +305,10 @@ class AutoMatteCombine:
         off_target = float((ag * (1 - gate))[have].sum() / ag[have].sum().clamp_min(1e-6))
 
         reasons, notes = [], []
-        if not keep_transparency and interior < min_interior:
+        items = AutoMatteCountPromptItems.parse(subject_text or "")
+        multi = len(items) > 1 or any(c > 1 for _, c in items)
+        # clearly missed even when see-through is wanted: a see-through subject is faint, not absent
+        if interior < (0.2 * min_interior if keep_transparency else min_interior):
             # the soft matte did not cover the subject: use the subject mask, lightly feathered
             out = F.avg_pool2d(sam[:, None], 3, stride=1, padding=1)[:, 0]
             mode = "subject_mask"
@@ -322,7 +325,10 @@ class AutoMatteCombine:
         if mode != "subject_mask" and missed_share > 0.005:
             feather = F.avg_pool2d(sam[:, None], 3, stride=1, padding=1)[:, 0]
             out = missed * torch.maximum(out, feather) + (1 - missed) * out
-            if missed_share > 0.02:
+            if not multi and missed_share > 0.5:
+                reasons.append(f"The soft matte covered only {1 - missed_share:.0%} of the subject; the rest has the "
+                               "tracker's harder edges")
+            elif missed_share > 0.02:
                 notes.append(f"The soft matte did not cover part of the subject ({missed_share:.0%}, e.g. a second named "
                              "object); there the edges come from the tracker and are harder")
         out = torch.where(absent[:, None, None], torch.zeros_like(out), out)
