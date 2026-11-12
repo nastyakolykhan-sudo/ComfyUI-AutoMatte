@@ -1,13 +1,15 @@
 """AutoMatte: glue nodes for a fully automatic subject matte.
 
-SAM 3.1 says WHAT the subject is, LTX-2.5 Alpha Gen says HOW SOFT its edges
-are, and these nodes do the rest without anyone choosing a model:
+A hard subject mask (e.g. SAM 3.1) says WHAT the subject is, a soft matte
+(e.g. LTX-2.5 Alpha Gen) says HOW SOFT its edges are, and these nodes do the
+rest without anyone choosing a model. Model-agnostic: no model limits in the
+logic, defaults change nothing.
 
-- AutoMatteFitLTX   resize + pad a clip to what LTX accepts (sides /32 within
-                    a max size, 8n+1 frames) and remember how to undo it.
-- AutoMatteCombine  gate the Alpha Gen matte to the SAM subject; if Alpha Gen
+- AutoMatteFit      resize + pad frames to a model's input rules (size caps,
+                    size multiple, k*n+offset frames) and remember how to undo it.
+- AutoMatteCombine  gate the soft matte to the subject mask; if the soft matte
                     made a solid object semi-transparent (a product, metal,
-                    a label), repair the interior from SAM and rescale the
+                    a label), fill the interior from the mask and rescale the
                     edges. Writes a JSON report of what it did.
 - AutoMatteRestore  crop the padding off and scale back to the source size and
                     frame count.
@@ -73,18 +75,26 @@ def _median01(values):
     return (idx + 0.5) / 1024.0
 
 
-class AutoMatteFitLTX:
-    """Fit frames to LTX: scale down (never up) to fit max_width x max_height,
-    pad right/bottom to a multiple of 32 by repeating edge pixels, and pad the
-    frame count to 8n+1 by repeating the last frame. Pad, never stretch."""
+class AutoMatteFit:
+    """Fit a frame batch to a model's input rules, reversibly (undo with Restore Size).
+
+    - Scale down (never up) so the long side <= max_long_side and the short side <= max_short_side
+      (whichever orientation the clip has). 0 = no limit.
+    - Pad right/bottom to a multiple of size_multiple by repeating edge pixels. 1 = off.
+    - Pad the frame count to frame_multiple * n + frame_offset by repeating the last frame. 1/0 = off.
+    Pads, never stretches. Defaults change nothing; e.g. LTX-2.5 wants long 1920, short 1088,
+    size multiple 32, frames 8n+1."""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "images": ("IMAGE",),
-                "max_width": ("INT", {"default": 1920, "min": 256, "max": 4096, "step": 32}),
-                "max_height": ("INT", {"default": 1088, "min": 256, "max": 4096, "step": 32}),
+                "max_long_side": ("INT", {"default": 0, "min": 0, "max": 16384, "tooltip": "0 = no limit."}),
+                "max_short_side": ("INT", {"default": 0, "min": 0, "max": 16384, "tooltip": "0 = no limit."}),
+                "size_multiple": ("INT", {"default": 1, "min": 1, "max": 512, "tooltip": "Pad width and height up to a multiple of this. 1 = off."}),
+                "frame_multiple": ("INT", {"default": 1, "min": 1, "max": 256, "tooltip": "Frame count becomes frame_multiple*n + frame_offset. 1 = off."}),
+                "frame_offset": ("INT", {"default": 0, "min": 0, "max": 255}),
             }
         }
 
@@ -93,18 +103,32 @@ class AutoMatteFitLTX:
     FUNCTION = "run"
     CATEGORY = "AutoMatte"
 
-    def run(self, images, max_width, max_height):
+    def run(self, images, max_long_side, max_short_side, size_multiple, frame_multiple, frame_offset):
         n, h, w, _ = images.shape
-        max_width -= max_width % 32
-        max_height -= max_height % 32
-        s = min(1.0, max_width / w, max_height / h)
+        m = max(1, size_multiple)
+        long_cap = max_long_side - max_long_side % m if max_long_side else 0
+        short_cap = max_short_side - max_short_side % m if max_short_side else 0
+        max_w, max_h = (long_cap, short_cap) if w >= h else (short_cap, long_cap)
+        s = 1.0
+        if max_w:
+            s = min(s, max_w / w)
+        if max_h:
+            s = min(s, max_h / h)
         cw, ch = max(1, int(round(w * s))), max(1, int(round(h * s)))
-        cw, ch = min(cw, max_width), min(ch, max_height)
-        W, H = int(math.ceil(cw / 32) * 32), int(math.ceil(ch / 32) * 32)
+        if max_w:
+            cw = min(cw, max_w)
+        if max_h:
+            ch = min(ch, max_h)
+        W, H = int(math.ceil(cw / m) * m), int(math.ceil(ch / m) * m)
         x = _resize_frames(images, ch, cw, "bicubic").clamp(0, 1)
         if (W, H) != (cw, ch):
             x = F.pad(x.permute(0, 3, 1, 2), (0, W - cw, 0, H - ch), mode="replicate").permute(0, 2, 3, 1)
-        L = n if (n - 1) % 8 == 0 else n + (8 - (n - 1) % 8)
+        k, off = max(1, frame_multiple), frame_offset % max(1, frame_multiple)
+        L = n
+        if k > 1 or off:
+            L = max(n, off)
+            while (L - off) % k:
+                L += 1
         if L > n:
             x = torch.cat([x, x[-1:].repeat(L - n, 1, 1, 1)], 0)
         fit = {"orig_w": w, "orig_h": h, "orig_n": n, "content_w": cw, "content_h": ch, "W": W, "H": H, "L": L}
@@ -112,30 +136,34 @@ class AutoMatteFitLTX:
 
 
 class AutoMatteCombine:
-    """Final matte from the SAM subject mask + the Alpha Gen matte.
+    """Final matte from a hard subject mask (e.g. SAM 3.1) and a soft matte (e.g. LTX-2.5 Alpha Gen).
 
-    interior = median Alpha Gen value deep inside the SAM subject (whole clip).
-    - SAM found nothing in any frame  -> Alpha Gen as is (its own subject pick).
+    interior = median soft-matte value deep inside the subject mask (whole clip).
+    - subject mask empty in every frame -> the soft matte as is (its own subject pick).
     - interior >= solid_threshold or keep_transparency
-                                       -> Alpha Gen edges, gated to the subject.
-    - otherwise (Alpha Gen made a solid object see-through)
-                                       -> max(eroded SAM, Alpha Gen / interior),
-                                          gated to the subject.
-    Frames where SAM lost the subject fall back to Alpha Gen ungated.
-    Radii are 0 = automatic (a fraction of the shorter side)."""
+                                          -> soft-matte edges, gated to the subject.
+    - otherwise (the soft matte made a solid object see-through)
+                                          -> max(eroded subject mask, soft matte / interior),
+                                             gated to the subject.
+    Frames where the subject mask is empty fall back to the soft matte ungated.
+    Radii are 0 = automatic (a fraction of the shorter side). subject_text (optional) is only
+    used for the report: typed but never found -> needs review; empty -> expected."""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "alpha_matte": ("IMAGE", {"tooltip": "Decoded Alpha Gen output (grey RGB)."}),
-                "subject_mask": ("MASK", {"tooltip": "SAM 3.1 mask of the subject, same frames."}),
+                "soft_matte": ("IMAGE", {"tooltip": "Soft matte as grey frames (white = subject)."}),
+                "subject_mask": ("MASK", {"tooltip": "Hard mask of the chosen subject, same frames."}),
                 "solid_threshold": ("FLOAT", {"default": 0.95, "min": 0.5, "max": 1.0, "step": 0.01}),
                 "keep_transparency": ("BOOLEAN", {"default": False,
-                                                   "tooltip": "On for glass, smoke, water: never repair the interior."}),
+                                                   "tooltip": "On for subjects that really are see-through: never repair the interior."}),
                 "gate_grow_px": ("INT", {"default": 0, "min": 0, "max": 256, "tooltip": "0 = auto (1.1% of shorter side)."}),
                 "core_shrink_px": ("INT", {"default": 0, "min": 0, "max": 128, "tooltip": "0 = auto (0.4% of shorter side)."}),
-            }
+            },
+            "optional": {
+                "subject_text": ("STRING", {"forceInput": True, "tooltip": "What the user asked for, only for the report."}),
+            },
         }
 
     RETURN_TYPES = ("MASK", "STRING")
@@ -143,8 +171,9 @@ class AutoMatteCombine:
     FUNCTION = "run"
     CATEGORY = "AutoMatte"
 
-    def run(self, alpha_matte, subject_mask, solid_threshold, keep_transparency, gate_grow_px, core_shrink_px):
-        ag = alpha_matte[..., :3].float().mean(-1).clamp(0, 1)  # (N,H,W)
+    def run(self, soft_matte, subject_mask, solid_threshold, keep_transparency, gate_grow_px, core_shrink_px,
+            subject_text=None):
+        ag = soft_matte[..., :3].float().mean(-1).clamp(0, 1)  # (N,H,W)
         n, H, W = ag.shape
         sam = subject_mask.float()
         if sam.dim() == 2:
@@ -154,6 +183,7 @@ class AutoMatteCombine:
         if sam.shape[0] < n:  # pad frame count by repeating the last mask
             sam = torch.cat([sam, sam[-1:].repeat(n - sam.shape[0], 1, 1)], 0)
         sam = (sam[:n] > 0.5).float()
+        asked = bool(subject_text and subject_text.strip())
 
         short = min(H, W)
         r_gate = gate_grow_px or max(2, round(0.011 * short))
@@ -161,11 +191,13 @@ class AutoMatteCombine:
         r_deep = max(r_gate, round(0.014 * short))
 
         present = sam.flatten(1).amax(1) > 0  # (N,)
-        report = {"frames": n, "size": [W, H], "subject_frames": int(present.sum()),
-                  "gate_grow_px": r_gate, "core_shrink_px": r_core}
+        report = {"frames": n, "size": [W, H], "subject": (subject_text or "").strip(),
+                  "subject_frames": int(present.sum()), "gate_grow_px": r_gate, "core_shrink_px": r_core}
 
         if not bool(present.any()):
-            report.update(mode="alpha_gen_only", reason="SAM found no subject; using Alpha Gen's own subject choice")
+            reasons = ["The subject you named was not found; the cutout is the model's own choice of main subject"] if asked else []
+            report.update(mode="soft_matte_only", notes=[] if asked else ["No subject named: the cutout is the main subject"],
+                          needs_review=bool(reasons), review_reasons=reasons)
             return (ag, json.dumps(report))
 
         gate = _morph(sam, r_gate, "dil")
@@ -175,33 +207,31 @@ class AutoMatteCombine:
 
         if keep_transparency or interior >= solid_threshold:
             out = ag * gate
-            mode = "alpha_gen_edges"
+            mode = "soft_edges"
         else:
             core = _morph(sam, r_core, "ero")
             out = torch.maximum(core, (ag / max(interior, 1e-3)).clamp(0, 1) * gate)
             mode = "interior_repaired"
-        out = torch.where(present[:, None, None], out, ag)  # SAM lost the subject: keep Alpha Gen
+        out = torch.where(present[:, None, None], out, ag)  # subject lost in a frame: keep the soft matte
 
         after = float(out[deep].mean()) if bool(deep.any()) else None
         missing = int((~present).sum())
         reasons, notes = [], []
         if missing:
-            reasons.append(f"SAM lost the subject in {missing} frame(s); those frames use Alpha Gen's own pick")
-        if mode == "interior_repaired" and interior < 0.6:
-            reasons.append("Alpha Gen interior very weak; edges may be unreliable")
+            reasons.append(f"The subject was lost in {missing} frame(s); those frames use the model's own pick")
+        if mode == "interior_repaired":
+            notes.append(f"The soft matte was partly see-through inside the subject ({interior:.2f}); the inside was filled solid")
         if off_target > 0.25:
-            notes.append("Alpha Gen also matted things outside the subject; the subject gate removed them")
-        report["notes"] = notes
-        report.update(mode=mode, interior_alpha_gen=round(interior, 3),
+            notes.append("The soft matte also covered things outside the subject; they were removed")
+        report.update(mode=mode, interior_soft_matte=round(interior, 3),
                       interior_after=None if after is None else round(after, 3),
-                      off_target_share=round(off_target, 4),
-                      frames_without_subject=missing,
-                      needs_review=bool(reasons), review_reasons=reasons)
+                      off_target_share=round(off_target, 4), frames_without_subject=missing,
+                      notes=notes, needs_review=bool(reasons), review_reasons=reasons)
         return (out.clamp(0, 1).contiguous(), json.dumps(report))
 
 
 class AutoMatteRestore:
-    """Undo AutoMatteFitLTX on a mask: drop padded frames and pixels, then scale
+    """Undo AutoMatte Fit on a mask: drop padded frames and pixels, then scale
     back to the source size."""
 
     @classmethod
@@ -278,15 +308,15 @@ class AutoMatteSaveReport:
 
 
 NODE_CLASS_MAPPINGS = {
-    "AutoMatteFitLTX": AutoMatteFitLTX,
+    "AutoMatteFit": AutoMatteFit,
     "AutoMatteCombine": AutoMatteCombine,
     "AutoMatteRestore": AutoMatteRestore,
     "AutoMatteToRGBA": AutoMatteToRGBA,
     "AutoMatteSaveReport": AutoMatteSaveReport,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "AutoMatteFitLTX": "AutoMatte: Fit Clip for LTX",
-    "AutoMatteCombine": "AutoMatte: Combine SAM + Alpha Gen",
+    "AutoMatteFit": "AutoMatte: Fit Frames",
+    "AutoMatteCombine": "AutoMatte: Combine Subject Mask + Soft Matte",
     "AutoMatteRestore": "AutoMatte: Restore Size",
     "AutoMatteToRGBA": "AutoMatte: To RGBA",
     "AutoMatteSaveReport": "AutoMatte: Save Report",
