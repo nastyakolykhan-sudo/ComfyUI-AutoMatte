@@ -15,7 +15,12 @@ and undo the fit. Model-agnostic: no model's limits in the logic, and every defa
 
 `keep_transparency` (Combine) skips the interior repair, for subjects that really are see-through (glass, water, smoke).
 
-Report fields: `mode` (`soft_edges`, `interior_repaired`, `subject_mask`, `soft_matte_only`), `interior_soft_matte`,
+`use_soft_matte` (Combine, default on): off = the subject mask only, lightly feathered, with the same out-of-shot and
+dropout handling. `soft_matte` is a lazy input, so with this off whatever produces the soft matte is never run: a
+faster, harder-edged choice (wire a boolean to it to offer both in one workflow). Nothing found → an empty matte,
+needs review.
+
+Report fields: `mode` (`soft_edges`, `interior_repaired`, `subject_mask`, `soft_matte_only`, `empty`), `soft_matte_used`, `interior_soft_matte`,
 `interior_after`, `off_target_share`, `frames_without_subject`, `absent_frames` (ranges left empty), `frames_held`,
 `notes`, `needs_review`, `review_reasons`.
 
