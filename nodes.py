@@ -66,6 +66,31 @@ def _morph(mask_nhw, radius, op):
     return torch.cat(out, 0)
 
 
+def _local_coverage(ag, sam, deep, short):
+    """How much of the subject the soft matte covers, per pixel: the soft matte's mean over the subject's interior in
+    a neighbourhood (~3% of the shorter side) and +-4 frames, computed at low resolution. Thin parts with no
+    interior fall back to the whole subject mask. Returns (N,H,W) in [0,1]."""
+    n, H, W = ag.shape
+    s = max(1, int(math.ceil(short / 192)))
+    h, w = max(1, H // s), max(1, W // s)
+    def small(x):
+        return F.adaptive_avg_pool2d(x[:, None].float(), (h, w))[:, 0]
+    a, m, d = small(ag), small(sam), small(deep.float())
+    r = max(1, round(0.03 * short / s))
+    k = 2 * r + 1
+    def blur(x):  # box blur in space (twice ~ gaussian), then +-4 frames
+        x = F.avg_pool2d(x[:, None], k, stride=1, padding=r, count_include_pad=False)
+        x = F.avg_pool2d(x, k, stride=1, padding=r, count_include_pad=False)[:, 0]
+        t = x.permute(1, 2, 0).reshape(1, h * w, n)
+        t = F.avg_pool1d(t, 9, stride=1, padding=4, count_include_pad=False)
+        return t.reshape(h, w, n).permute(2, 0, 1)
+    num_d, den_d = blur(a * d), blur(d)
+    num_m, den_m = blur(a * m), blur(m)
+    cov = torch.where(den_d > 0.02, num_d / den_d.clamp_min(1e-4), num_m / den_m.clamp_min(1e-4))
+    cov = torch.where(den_m > 1e-3, cov, torch.ones_like(cov))
+    return F.interpolate(cov[:, None], size=(H, W), mode="bilinear", align_corners=False)[:, 0].clamp(0, 1)
+
+
 def _median01(values):
     """Median of values in [0,1] via a 1024-bin histogram (cheap on huge sets)."""
     if values.numel() == 0:
@@ -267,8 +292,16 @@ class AutoMatteCombine:
 
         gate = _morph(sam, r_gate, "dil")
         deep = _morph(sam, r_deep, "ero") > 0.5
+        # parts of the subject the soft matte missed (e.g. a second named object it didn't pick): tracker outline there
+        miss_lo, miss_hi = 0.16 * min_interior, 0.48 * min_interior
+        cov = _local_coverage(ag, sam, deep, short)
+        missed = ((miss_hi - cov) / max(miss_hi - miss_lo, 1e-6)).clamp(0, 1) * have[:, None, None].float()
         dsel = deep & have[:, None, None]
-        interior = _median01(ag[dsel]) if bool(dsel.any()) else _median01(ag[(sam > 0.5) & have[:, None, None]])
+        covered = dsel & (missed < 0.5)
+        if bool(covered.any()):
+            interior = _median01(ag[covered])
+        else:
+            interior = _median01(ag[dsel]) if bool(dsel.any()) else _median01(ag[(sam > 0.5) & have[:, None, None]])
         off_target = float((ag * (1 - gate))[have].sum() / ag[have].sum().clamp_min(1e-6))
 
         reasons, notes = [], []
@@ -285,13 +318,20 @@ class AutoMatteCombine:
             out = torch.maximum(core, (ag / max(interior, 1e-3)).clamp(0, 1) * gate)
             mode = "interior_repaired"
             notes.append(f"The soft matte was partly see-through inside the subject ({interior:.2f}); the inside was filled solid")
+        missed_share = float((missed * sam).sum() / sam[have].sum().clamp_min(1.0))
+        if mode != "subject_mask" and missed_share > 0.005:
+            feather = F.avg_pool2d(sam[:, None], 3, stride=1, padding=1)[:, 0]
+            out = missed * torch.maximum(out, feather) + (1 - missed) * out
+            if missed_share > 0.02:
+                notes.append(f"The soft matte did not cover part of the subject ({missed_share:.0%}, e.g. a second named "
+                             "object); there the edges come from the tracker and are harder")
         out = torch.where(absent[:, None, None], torch.zeros_like(out), out)
 
         after = float(out[dsel].mean()) if bool(dsel.any()) else None
         range_notes(notes)
         if off_target > 0.25:
             notes.append("The soft matte also covered things outside the subject; they were removed")
-        report.update(mode=mode, interior_soft_matte=round(interior, 3),
+        report.update(mode=mode, interior_soft_matte=round(interior, 3), missed_share=round(missed_share, 4),
                       interior_after=None if after is None else round(after, 3),
                       off_target_share=round(off_target, 4), frames_without_subject=int(absent.sum()),
                       frames_held=held, absent_frames=absent_ranges,
