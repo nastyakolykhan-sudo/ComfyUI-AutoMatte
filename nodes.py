@@ -145,9 +145,10 @@ class AutoMatteCombine:
     - otherwise (the soft matte made a solid object see-through)
                                           -> max(eroded subject mask, soft matte / interior),
                                              gated to the subject.
-    Frames where the subject mask is empty fall back to the soft matte ungated.
-    Radii are 0 = automatic (a fraction of the shorter side). subject_text (optional) is only
-    used for the report: typed but never found -> needs review; empty -> expected."""
+    - interior < min_interior (the soft matte missed the subject) -> the subject mask, lightly feathered.
+    A named subject missing for up to hold_frames frames holds the nearest mask; longer absences
+    (the subject is out of shot) come out empty. subject_text wired and empty = no subject named:
+    the soft matte as is. Radii are 0 = automatic (a fraction of the shorter side)."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -162,7 +163,9 @@ class AutoMatteCombine:
                 "core_shrink_px": ("INT", {"default": 0, "min": 0, "max": 128, "tooltip": "0 = auto (0.4% of shorter side)."}),
             },
             "optional": {
-                "subject_text": ("STRING", {"forceInput": True, "tooltip": "What the user asked for, only for the report."}),
+                "subject_text": ("STRING", {"forceInput": True, "tooltip": "What the user asked for. Wired and empty = no subject named: the soft matte is used as is."}),
+                "hold_frames": ("INT", {"default": 4, "min": 0, "max": 64, "tooltip": "Gaps up to this many frames hold the nearest subject mask; longer absences come out empty."}),
+                "min_interior": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Below this, the soft matte missed the subject: the subject mask is used instead."}),
             },
         }
 
@@ -172,7 +175,7 @@ class AutoMatteCombine:
     CATEGORY = "AutoMatte"
 
     def run(self, soft_matte, subject_mask, solid_threshold, keep_transparency, gate_grow_px, core_shrink_px,
-            subject_text=None):
+            subject_text=None, hold_frames=4, min_interior=0.25):
         ag = soft_matte[..., :3].float().mean(-1).clamp(0, 1)  # (N,H,W)
         n, H, W = ag.shape
         sam = subject_mask.float()
@@ -183,7 +186,8 @@ class AutoMatteCombine:
         if sam.shape[0] < n:  # pad frame count by repeating the last mask
             sam = torch.cat([sam, sam[-1:].repeat(n - sam.shape[0], 1, 1)], 0)
         sam = (sam[:n] > 0.5).float()
-        asked = bool(subject_text and subject_text.strip())
+        wired = subject_text is not None
+        asked = bool(wired and subject_text.strip())
 
         short = min(H, W)
         r_gate = gate_grow_px or max(2, round(0.011 * short))
@@ -194,38 +198,73 @@ class AutoMatteCombine:
         report = {"frames": n, "size": [W, H], "subject": (subject_text or "").strip(),
                   "subject_frames": int(present.sum()), "gate_grow_px": r_gate, "core_shrink_px": r_core}
 
-        if not bool(present.any()):
-            reasons = ["The subject you named was not found; the cutout is the model's own choice of main subject"] if asked else []
-            report.update(mode="soft_matte_only", notes=[] if asked else ["No subject named: the cutout is the main subject"],
-                          needs_review=bool(reasons), review_reasons=reasons)
+        if (wired and not asked) or not bool(present.any()):
+            reasons = (["The subject you named was not found; the cutout is the model's own choice of main subject"]
+                       if asked else [])
+            notes = [] if asked else ["No subject named: the cutout is the main subject"]
+            report.update(mode="soft_matte_only", notes=notes, needs_review=bool(reasons), review_reasons=reasons)
             return (ag, json.dumps(report))
+
+        # frames without the subject: bridge short gaps by holding the nearest mask, leave long absences empty
+        idx = torch.nonzero(present).flatten().tolist()
+        held, absent_ranges = 0, []
+        i = 0
+        while i < n:
+            if bool(present[i]):
+                i += 1
+                continue
+            j = i
+            while j < n and not bool(present[j]):
+                j += 1
+            gap = j - i
+            bounded = i > 0 or j < n
+            if gap <= hold_frames and bounded:
+                for f in range(i, j):
+                    near = min(idx, key=lambda q: abs(q - f))
+                    sam[f] = sam[near]
+                held += gap
+            else:
+                absent_ranges.append([i, j - 1])
+            i = j
+        absent = torch.zeros(n, dtype=torch.bool)
+        for a, b in absent_ranges:
+            absent[a:b + 1] = True
+        have = ~absent
 
         gate = _morph(sam, r_gate, "dil")
         deep = _morph(sam, r_deep, "ero") > 0.5
-        interior = _median01(ag[deep]) if bool(deep.any()) else _median01(ag[sam > 0.5])
-        off_target = float((ag * (1 - gate))[present].sum() / ag[present].sum().clamp_min(1e-6))
+        dsel = deep & have[:, None, None]
+        interior = _median01(ag[dsel]) if bool(dsel.any()) else _median01(ag[(sam > 0.5) & have[:, None, None]])
+        off_target = float((ag * (1 - gate))[have].sum() / ag[have].sum().clamp_min(1e-6))
 
-        if keep_transparency or interior >= solid_threshold:
+        reasons, notes = [], []
+        if not keep_transparency and interior < min_interior:
+            # the soft matte did not cover the subject: use the subject mask, lightly feathered
+            out = F.avg_pool2d(sam[:, None], 3, stride=1, padding=1)[:, 0]
+            mode = "subject_mask"
+            reasons.append(f"The soft matte did not cover the subject ({interior:.2f}); the edges come from the tracker and are harder")
+        elif keep_transparency or interior >= solid_threshold:
             out = ag * gate
             mode = "soft_edges"
         else:
             core = _morph(sam, r_core, "ero")
             out = torch.maximum(core, (ag / max(interior, 1e-3)).clamp(0, 1) * gate)
             mode = "interior_repaired"
-        out = torch.where(present[:, None, None], out, ag)  # subject lost in a frame: keep the soft matte
-
-        after = float(out[deep].mean()) if bool(deep.any()) else None
-        missing = int((~present).sum())
-        reasons, notes = [], []
-        if missing:
-            reasons.append(f"The subject was lost in {missing} frame(s); those frames use the model's own pick")
-        if mode == "interior_repaired":
             notes.append(f"The soft matte was partly see-through inside the subject ({interior:.2f}); the inside was filled solid")
+        out = torch.where(absent[:, None, None], torch.zeros_like(out), out)
+
+        after = float(out[dsel].mean()) if bool(dsel.any()) else None
+        if absent_ranges:
+            notes.append("The subject is not in frames " + ", ".join(f"{a}-{b}" if a != b else f"{a}" for a, b in absent_ranges)
+                         + "; those frames are empty")
+        if held:
+            notes.append(f"The subject was briefly lost in {held} frame(s); the nearest mask was held")
         if off_target > 0.25:
             notes.append("The soft matte also covered things outside the subject; they were removed")
         report.update(mode=mode, interior_soft_matte=round(interior, 3),
                       interior_after=None if after is None else round(after, 3),
-                      off_target_share=round(off_target, 4), frames_without_subject=missing,
+                      off_target_share=round(off_target, 4), frames_without_subject=int(absent.sum()),
+                      frames_held=held, absent_frames=absent_ranges,
                       notes=notes, needs_review=bool(reasons), review_reasons=reasons)
         return (out.clamp(0, 1).contiguous(), json.dumps(report))
 
