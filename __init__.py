@@ -6,9 +6,10 @@ from .effects import NODE_CLASS_MAPPINGS as _FX, NODE_DISPLAY_NAME_MAPPINGS as _
 from .finish import NODE_CLASS_MAPPINGS as _FIN, NODE_DISPLAY_NAME_MAPPINGS as _FIN_NAMES
 from .retime import NODE_CLASS_MAPPINGS as _RT, NODE_DISPLAY_NAME_MAPPINGS as _RT_NAMES
 from .relight import NODE_CLASS_MAPPINGS as _RL, NODE_DISPLAY_NAME_MAPPINGS as _RL_NAMES
+from .passes import NODE_CLASS_MAPPINGS as _PS, NODE_DISPLAY_NAME_MAPPINGS as _PS_NAMES
 
-NODE_CLASS_MAPPINGS = {**_CORE, **_LAYERS, **_FX, **_FIN, **_RT, **_RL}
-NODE_DISPLAY_NAME_MAPPINGS = {**_CORE_NAMES, **_LAYER_NAMES, **_FX_NAMES, **_FIN_NAMES, **_RT_NAMES, **_RL_NAMES}
+NODE_CLASS_MAPPINGS = {**_CORE, **_LAYERS, **_FX, **_FIN, **_RT, **_RL, **_PS}
+NODE_DISPLAY_NAME_MAPPINGS = {**_CORE_NAMES, **_LAYER_NAMES, **_FX_NAMES, **_FIN_NAMES, **_RT_NAMES, **_RL_NAMES, **_PS_NAMES}
 
 # Text on Surface needs OpenCV (opencv-python-headless, in requirements.txt): without it the other nodes still load.
 try:
