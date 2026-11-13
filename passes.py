@@ -369,6 +369,13 @@ class AutoMatteEdges:
                 pbar.update(x.shape[0])
         m.to(mm.unet_offload_device())
         e = torch.cat(out, 0)
+        # TEED's flat areas sit around 0.2, not 0: set the black point at the clip's median (most pixels are no edge)
+        # and the white point at its strongest edges, once for the whole clip so lines don't pump.
+        flat = e.flatten()
+        if flat.numel() > 4_000_000:
+            flat = flat[torch.randperm(flat.numel())[:4_000_000]]
+        lo, hi = torch.quantile(flat, 0.5), torch.quantile(flat, 0.995)
+        e = ((e - lo) / (hi - lo).clamp_min(1e-6)).clamp(0, 1)
         return (e[..., None].repeat(1, 1, 1, 3).contiguous(),)
 
 
