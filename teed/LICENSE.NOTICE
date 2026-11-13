@@ -1,0 +1,2 @@
+teed/ted.py and teed/teed_biped_7.pth come from https://github.com/xavysp/TEED (MIT licence, LICENSE in this folder).
+teed_biped_7.pth = checkpoints/BIPED/7/7_model.pth, sha256 d0109e7f40e7d9f1f495d34947eb08167e8fbb0a13b4e6ab3121261fb8d5a416.

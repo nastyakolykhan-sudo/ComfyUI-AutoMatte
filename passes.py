@@ -317,13 +317,70 @@ class AutoMatteDepthPasses:
         return (grey, _turbo(x).contiguous())
 
 
+# --------------------------------------------------------------------------------------------- Edges
+_TEED = {}
+
+
+def _teed():
+    if "m" not in _TEED:
+        from .teed.ted import TED
+        m = TED()
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "teed", "teed_biped_7.pth")
+        m.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
+        _TEED["m"] = m.eval()
+    return _TEED["m"]
+
+
+class AutoMatteEdges:
+    """Soft line edges from TEED (Tiny and Efficient Edge Detector, MIT; 58k parameters, weights in the pack): the
+    outlines and main contours as a greyscale line drawing (white = edge), with little texture noise."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "resolution": ("INT", {"default": 1024, "min": 256, "max": 4096, "step": 16,
+                                       "tooltip": "Long side the detector sees; higher = finer lines."}),
+                "batch": ("INT", {"default": 8, "min": 1, "max": 64}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("edges",)
+    FUNCTION = "run"
+    CATEGORY = "AutoMatte/Passes"
+
+    def run(self, images, resolution, batch):
+        dev = mm.get_torch_device()
+        m = _teed().to(dev)
+        n, h, w, _ = images.shape
+        sc = resolution / max(h, w)
+        ph, pw = max(16, round(h * sc / 16) * 16), max(16, round(w * sc / 16) * 16)
+        out = []
+        pbar = comfy.utils.ProgressBar(n)
+        with torch.no_grad():
+            for i in range(0, n, batch):
+                x = images[i:i + batch].permute(0, 3, 1, 2).to(dev).float()
+                x = F.interpolate(x, size=(ph, pw), mode="bicubic", align_corners=False).clamp(0, 1) * 255.0
+                e = torch.sigmoid(torch.stack(m(x), 0).mean(0))  # mean of the 3 side outputs + fusion
+                e = F.interpolate(e, size=(h, w), mode="bilinear", align_corners=False).clamp(0, 1)
+                out.append(e[:, 0].cpu())
+                pbar.update(x.shape[0])
+        m.to(mm.unet_offload_device())
+        e = torch.cat(out, 0)
+        return (e[..., None].repeat(1, 1, 1, 3).contiguous(),)
+
+
 NODE_CLASS_MAPPINGS = {
     "AutoMatteImageOrVideo": AutoMatteImageOrVideo,
     "AutoMatteMarigoldPasses": AutoMatteMarigoldPasses,
     "AutoMatteDepthPasses": AutoMatteDepthPasses,
+    "AutoMatteEdges": AutoMatteEdges,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AutoMatteImageOrVideo": "Image or Video (AutoMatte)",
     "AutoMatteMarigoldPasses": "Material Passes: Marigold (AutoMatte)",
     "AutoMatteDepthPasses": "Depth Passes: grey + heat map (AutoMatte)",
+    "AutoMatteEdges": "Edges: TEED soft lines (AutoMatte)",
 }
