@@ -7,6 +7,7 @@ reads what each model predicts from its own config (target names), so a newer Ma
 import json
 import logging
 import os
+import tempfile
 
 import torch
 import torch.nn.functional as F
@@ -71,15 +72,38 @@ class AutoMatteImageOrVideo:
 _PIPES = {}
 
 
+SHARED_PREFIX = "marigold-sd2-shared"  # files identical across Marigold models (SD2 text encoder, VAE, tokenizer, scheduler)
+
+
 def _marigold_dir(name):
-    """models/diffusers/<name> (the build stages it there); downloads the fp16 files from Hugging Face if missing."""
-    roots = folder_paths.get_folder_paths("diffusers") if "diffusers" in folder_paths.folder_names_and_paths else []
-    roots = list(roots) + [os.path.join(folder_paths.models_dir, "diffusers")]
+    """A diffusers folder for a Marigold model. Looks for models/diffusers/<name>/ first; then for the flat files a
+    build stages (builds take no sub-folders): `<name>__unet__config.json`, … plus `marigold-sd2-shared__…` for the
+    parts every Marigold shares, linked into a folder in the temp dir; else downloads the fp16 files from HF."""
+    roots = list(folder_paths.get_folder_paths("diffusers")) if "diffusers" in folder_paths.folder_names_and_paths else []
+    roots.append(os.path.join(folder_paths.models_dir, "diffusers"))
     short = name.split("/")[-1]
     for r in roots:
         p = os.path.join(r, short)
         if os.path.isfile(os.path.join(p, "model_index.json")):
             return p
+    for r in roots:
+        if not os.path.isdir(r):
+            continue
+        files = os.listdir(r)
+        if f"{short}__model_index.json" not in files:
+            continue
+        target = os.path.join(tempfile.gettempdir(), "automatte_marigold", short)
+        for prefix in (SHARED_PREFIX, short):  # the model's own files win
+            for f in files:
+                if not f.startswith(prefix + "__"):
+                    continue
+                rel = f[len(prefix) + 2:].replace("__", os.sep)
+                dst = os.path.join(target, rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                if os.path.lexists(dst):
+                    os.remove(dst)
+                os.symlink(os.path.join(r, f), dst)
+        return target
     target = os.path.join(roots[-1], short)
     repo = name if "/" in name else f"prs-eth/{name}"
     log.warning("AutoMatte: %s not staged, downloading %s to %s", short, repo, target)
