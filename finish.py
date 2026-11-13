@@ -171,3 +171,103 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AutoMatteLayerGrade": "AutoMatte: Layer Grade",
     "AutoMatteObscure": "AutoMatte: Obscure (blur / pixelate)",
 }
+
+
+class AutoMatteBackgroundSwap:
+    """Put the subject (inside the matte) over a new background (an image or a clip; scaled to cover the frame, a
+    shorter clip loops). Edge pixels are rebuilt from the subject's own colour (its interior spread outwards) rather
+    than the old background showing through the soft edge, so no old-background fringe stays; `light_wrap` lets the
+    new background's light spill a little onto the edges; `harmonize` moves the subject's overall colour cast and
+    brightness part of the way towards the new background's (0 = none). Outputs the composite and a report."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "matte": ("MASK",),
+                "background": ("IMAGE", {"tooltip": "One image or a clip's frames."}),
+            },
+            "optional": {
+                "light_wrap": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "harmonize": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "report")
+    FUNCTION = "run"
+    CATEGORY = "AutoMatte/Layers"
+
+    @staticmethod
+    def _cover(bg, h, w):
+        """Scale (N,H,W,C) to cover h x w, centre crop."""
+        bh, bw = bg.shape[1], bg.shape[2]
+        s = max(h / bh, w / bw)
+        nh, nw = max(h, round(bh * s)), max(w, round(bw * s))
+        t = F.interpolate(bg.permute(0, 3, 1, 2), size=(nh, nw), mode="bilinear", align_corners=False, antialias=True)
+        y0, x0 = (nh - h) // 2, (nw - w) // 2
+        return t[:, :, y0:y0 + h, x0:x0 + w].permute(0, 2, 3, 1)
+
+    def run(self, images, matte, background, light_wrap=0.35, harmonize=0.3):
+        n, h, w = images.shape[0], images.shape[1], images.shape[2]
+        m = _fit_mask(matte, n, h, w)
+        dev = _device()
+        short = min(h, w)
+        r_fg = max(3, round(0.01 * short))
+        r_wrap = max(3, round(0.015 * short))
+        nb = background.shape[0]
+        # colour statistics for harmonize: subject vs new background (whole clip, OKLab means)
+        sub_s, bg_s = [], []
+        for i in range(0, n, CHUNK):
+            j = min(n, i + CHUNK)
+            mm = m[i:j].to(dev) > 0.5
+            if bool(mm.any()):
+                sub_s.append(srgb_to_ok(images[i:j, ..., :3].to(dev).float())[mm].mean(0).cpu())
+        for i in range(0, min(nb, 64), 8):
+            bg_s.append(srgb_to_ok(self._cover(background[i:i + 8, ..., :3].to(dev).float(), 256, 256)).reshape(-1, 3).mean(0).cpu())
+        sub_mean = torch.stack(sub_s).mean(0) if sub_s else torch.zeros(3)
+        bg_mean = torch.stack(bg_s).mean(0) if bg_s else torch.zeros(3)
+        shift = torch.zeros(3)
+        if harmonize > 0 and sub_s:
+            shift[0] = harmonize * 0.5 * float(bg_mean[0] - sub_mean[0])          # half of the lightness gap
+            shift[1:] = harmonize * (bg_mean[1:] - sub_mean[1:]) * 0.5            # half of the colour cast
+        shift = shift.to(dev)
+        out = torch.empty_like(images[..., :3])
+        for i in range(0, n, CHUNK):
+            j = min(n, i + CHUNK)
+            rgb = images[i:j, ..., :3].to(dev).float()
+            mm = m[i:j].to(dev)
+            idx = torch.arange(i, j) % nb
+            bg = self._cover(background[idx][..., :3].to(dev).float(), h, w)
+            # subject colour at soft edges: interior colour spread outwards
+            core = (mm > 0.9).float()
+            den = _box(_box(core, r_fg), r_fg)
+            fg_est = _box(_box(rgb * core[..., None], r_fg), r_fg) / den.clamp_min(1e-4)[..., None]
+            k = (_smoothstep_t(mm, 0.5, 0.95))[..., None]
+            fg = torch.where((den > 0.02)[..., None], k * rgb + (1 - k) * fg_est, rgb)
+            if harmonize > 0:
+                ok = srgb_to_ok(fg)
+                fg = ok_to_srgb(ok + shift)
+            a = mm[..., None]
+            comp = fg * a + bg * (1 - a)
+            if light_wrap > 0:
+                bg_blur = _box(_box(bg, r_wrap), r_wrap)
+                edge = (a * (1 - _box(_box(mm, r_wrap), r_wrap)[..., None])).clamp(0, 1) * 2.0
+                comp = comp + light_wrap * edge.clamp(0, 1) * (bg_blur - comp) * a
+            out[i:j] = comp.clamp(0, 1).to(out.dtype).cpu()
+        rep = {"edit": "background_swap", "background_frames": nb, "light_wrap": light_wrap, "harmonize": harmonize,
+               "subject_lightness": round(float(sub_mean[0]), 1), "background_lightness": round(float(bg_mean[0]), 1),
+               "harmonize_shift": [round(float(v), 2) for v in shift.cpu()], "notes": []}
+        if nb > 1 and nb < n:
+            rep["notes"].append(f"The background clip has {nb} frames for {n}: it loops")
+        return (out, json.dumps(rep))
+
+
+def _smoothstep_t(x, e0, e1):
+    t = ((x - e0) / (e1 - e0)).clamp(0, 1)
+    return t * t * (3 - 2 * t)
+
+
+NODE_CLASS_MAPPINGS["AutoMatteBackgroundSwap"] = AutoMatteBackgroundSwap
+NODE_DISPLAY_NAME_MAPPINGS["AutoMatteBackgroundSwap"] = "AutoMatte: Background Swap"
