@@ -307,11 +307,18 @@ def _fade(L):
     return ((100 - L) / 10).clamp(0, 1) * (L / 6).clamp(0, 1)
 
 
+def _box_nchw(t, r):
+    """Separable box blur (rows then columns) of (N,C,H,W), edges normalised: same result as a 2D box, O(r) not O(r^2)."""
+    k = 2 * r + 1
+    t = F.avg_pool2d(t, (1, k), stride=1, padding=(0, r), count_include_pad=False)
+    return F.avg_pool2d(t, (k, 1), stride=1, padding=(r, 0), count_include_pad=False)
+
+
 def _box(x, r):
     """Box blur of (N,H,W) or (N,H,W,C) with radius r (edges normalised)."""
     if x.dim() == 4:
-        return F.avg_pool2d(x.permute(0, 3, 1, 2), 2 * r + 1, stride=1, padding=r, count_include_pad=False).permute(0, 2, 3, 1)
-    return F.avg_pool2d(x[:, None], 2 * r + 1, stride=1, padding=r, count_include_pad=False)[:, 0]
+        return _box_nchw(x.permute(0, 3, 1, 2), r).permute(0, 2, 3, 1)
+    return _box_nchw(x[:, None], r)[:, 0]
 
 
 def _guided(guide, p, r, eps=1e-3):
@@ -477,10 +484,13 @@ class AutoMatteRecolour:
             main = torch.ones_like(w_s, dtype=torch.bool)
         lab_main = srgb_to_lab(rgb_s[main].double())
         before = lab_main.mean(0).tolist()
-        kept_share = float((w_s < 0.5).float().mean())
+        c_s = torch.hypot(ok_s[:, 1], ok_s[:, 2])
+        kept_share = float(((w_s < 0.5) & (c_s >= 6)).float().mean())   # parts in another colour, kept
+        neutral_kept = float(((c_s < 6) & ~main).float().mean()) if d["kind"] == "chromatic" else 0.0
         report.update(subject_colour_kind=d["kind"], subject_chromatic_share=round(d["share"], 3),
                       subject_colour_before=lab_to_hex(before),
-                      delta_e00_before=round(ciede2000(before, lab_t), 2), kept_share=round(kept_share, 3))
+                      delta_e00_before=round(ciede2000(before, lab_t), 2), kept_share=round(kept_share, 3),
+                      neutral_kept_share=round(neutral_kept, 3))
 
         L_main = ok_s[main, 0]
         P["mean_l"] = float(L_main.mean())
@@ -586,20 +596,93 @@ class AutoMatteRecolour:
                                                     "(a very light, dark or saturated colour can't be reached on this subject)")
             else:
                 report["delta_e00_hue_chroma_after"] = round(ciede2000(lab_after, [lab_after[0], lab_t[1], lab_t[2]]), 2)
-        if kept_share > 0.3:
-            report["notes"].append(f"{kept_share:.0%} of the subject is in another colour and was kept "
-                                   "(name the part to recolour, e.g. 'bottle body', to change only that)")
+        if kept_share > 0.1:
+            report["notes"].append(f"{kept_share:.0%} of the subject is in another colour and was kept (a logo, a cap, "
+                                   "skin); name the part to recolour (e.g. 'bottle body') to be sure")
+        if neutral_kept > 0.1:
+            report["notes"].append(f"White, grey and black parts ({neutral_kept:.0%} of the subject) kept their colour")
         if report["frames_without_subject"]:
             report["notes"].append(f"{report['frames_without_subject']} frames have no subject and are unchanged")
         report["needs_review"] = bool(report["review_reasons"])
         return (out, json.dumps(report))
 
 
+# --------------------------------------------------------------------------------------------- Protect people
+_PEOPLE_WORDS = {"person", "persons", "people", "man", "men", "woman", "women", "girl", "girls", "boy", "boys", "child",
+                 "children", "kid", "kids", "baby", "model", "dancer", "face", "faces", "skin", "hair", "hand", "hands",
+                 "arm", "arms", "leg", "legs", "lips", "lip", "nail", "nails", "eye", "eyes", "eyebrows", "body",
+                 "neck", "head", "beard", "makeup", "make-up", "lipstick", "nail polish", "teeth", "tattoo", "feet", "foot"}
+
+
+def names_people(text):
+    words = set(re.findall(r"[a-z\-]+", (text or "").lower()))
+    return bool(words & _PEOPLE_WORDS) or "nail polish" in (text or "").lower()
+
+
+class AutoMatteProtect:
+    """Take parts that must not change out of a matte, e.g. people's faces, necks, hands and hair when a garment or a
+    held product is edited (a soft matte of a coat reaches into the neck and the hand). `protect` is lazy: whatever
+    makes it (e.g. SAM on "face, neck, hand, hair") only runs when the subject text doesn't itself name people or a
+    body part (then nothing is protected: "hair", "lips", "woman" are the subject). The protect mask is grown a
+    little and feathered, then removed: matte * (1 - protect). `report` (JSON, optional) gets the protected share."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "matte": ("MASK",),
+                "protect": ("MASK", {"lazy": True, "tooltip": "What must stay as it is (white). Only computed when the subject doesn't name people."}),
+            },
+            "optional": {
+                "subject_text": ("STRING", {"forceInput": True, "tooltip": "What is edited; naming people or a body part turns protection off."}),
+                "report": ("STRING", {"forceInput": True}),
+            },
+        }
+
+    RETURN_TYPES = ("MASK", "STRING")
+    RETURN_NAMES = ("matte", "report")
+    FUNCTION = "run"
+    CATEGORY = "AutoMatte/Layers"
+
+    def check_lazy_status(self, matte, protect=None, subject_text=None, report=None):
+        if names_people(subject_text):
+            return []
+        return ["protect"] if protect is None else []
+
+    def run(self, matte, protect=None, subject_text=None, report=None):
+        try:
+            rep = json.loads(report) if report else {}
+        except Exception:
+            rep = {"report": report}
+        n, h, w = matte.shape
+        if names_people(subject_text) or protect is None:
+            rep["people_protected"] = False
+            return (matte, json.dumps(rep))
+        p = _fit_mask(protect, n, h, w)
+        short = min(h, w)
+        r = max(1, round(0.004 * short))
+        k = 2 * r + 1
+        p = F.max_pool2d(p[:, None], (1, k), stride=1, padding=(0, r))
+        p = F.max_pool2d(p, (k, 1), stride=1, padding=(r, 0))[:, 0]
+        p = _box(p, r).clamp(0, 1)
+        before = float((matte > 0.5).float().sum()) or 1.0
+        out = (matte.float() * (1 - p)).clamp(0, 1)
+        share = 1 - float((out > 0.5).float().sum()) / before
+        rep["people_protected"] = True
+        rep["protected_share_of_matte"] = round(share, 4)
+        if share > 0.002:
+            notes = rep.setdefault("notes", [])
+            notes.append(f"Faces, necks, hands and hair inside the matte ({share:.1%} of it) were kept as they are")
+        return (out.contiguous(), json.dumps(rep))
+
+
 NODE_CLASS_MAPPINGS = {
     "AutoMatteGivenOrMade": AutoMatteGivenOrMade,
     "AutoMatteRecolour": AutoMatteRecolour,
+    "AutoMatteProtect": AutoMatteProtect,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AutoMatteGivenOrMade": "AutoMatte: Given or Made Matte",
     "AutoMatteRecolour": "AutoMatte: Recolour",
+    "AutoMatteProtect": "AutoMatte: Protect People",
 }
