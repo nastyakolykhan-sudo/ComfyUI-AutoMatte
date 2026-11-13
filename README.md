@@ -28,5 +28,17 @@ Report fields: `mode` (`soft_edges`, `interior_repaired`, `subject_mask`, `soft_
 Example settings for LTX-2.5 (Alpha Gen IC-LoRA): Fit with long 1920, short 1088, size multiple 32, frames 8n+1
 (`frame_multiple` 8, `frame_offset` 1).
 
+## Layer edits (`layers.py`)
+Cheap, localized edits on a clip once a subject matte exists (Miracle-style layer editing). Pixels outside the
+matte come back bit for bit.
+
+| Node | What it does |
+|---|---|
+| AutoMatte: Given or Made Matte | Picks the matte for an edit: the `matte_video` when one is given (a saved matte of the same clip, e.g. from an earlier segmentation run), otherwise the graph's own `matte`. `matte`, `report` and `extra` are lazy, so the segmentation branch only runs when no matte video is given. An empty WorkflowIO Video Input counts as "not given". A given matte must match the clip (aspect within 2 %, frame count within 2 % or 2 frames); it is scaled to the frame size and padded/cut to the frame count. Outputs the matte, a JSON report (`matte_source` given/made, plus the segmentation report when made) and `made` (e.g. for an output's `include`). |
+| AutoMatte: Recolour | **Recolour**: the subject's main colour becomes an exact colour (hex `#2E7D32`, `rgb(46, 125, 50)`, a CSS name such as `navy` or `forest green`, or a few design names: cream, rust, burgundy, mustard, emerald, camel, charcoal, mint, terracotta, cobalt, sky, sage, lilac, mauve, ochre). Lightness, hue and chroma are calibrated on the clip so the measured main colour lands on the target; the light/dark variation is kept (compressed only if it would clip), so shading, reflections and print survive. On a coloured subject, neutral parts (white sole, white label, highlights, black print) stay, gradients keep their fade, and parts in a clearly different hue (a gold cap, a logo) are kept; a neutral or barely coloured subject (white, grey, black, denim) takes the colour everywhere except clearly coloured details. **Correct** (brand colour lock): for a subject that should be this colour but drifts, each frame's main colour is turned onto the target hue and chroma, lightness untouched. Edits in OKLab (hue-linear), statistics over the whole clip (Recolour) or per frame smoothed over 5 frames (Correct): no flicker. Soft edges change only by the subject's own colour change, so the background seen through an edge stays. JSON report: target, subject colour before/after, CIEDE2000 before/after (Correct: hue/chroma only, per-frame mean/max before), share of the subject kept in another colour, shading kept, review reasons. |
+
+Name the part to recolour in the segmentation subject (`bottle body`, `denim jacket`): a matte of a whole person
+recolours skin and hair too.
+
 Only torch, no model weights, so nothing in this pack carries a model licence. Check the licences of the models you
 pair it with.
