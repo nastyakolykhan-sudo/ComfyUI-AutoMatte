@@ -46,5 +46,18 @@ matte come back bit for bit.
 Name the part to recolour in the segmentation subject (`bottle body`, `denim jacket`): a matte of a whole person
 recolours skin and hair too.
 
-Only torch, no model weights, so nothing in this pack carries a model licence. Check the licences of the models you
+## Retime (`retime.py`), Relight (`relight.py`), Text on Surface (`text_surface.py`)
+Designed and unit-checked in the Miracle layer research (full designs in the workflows' READMEs):
+- **AutoMatte: Time Map / Retime / Given or Made Plate / Pick Interp Model**: speed changes of the whole clip, one
+  layer (subject or background over a clean plate), hero freeze and seamless loops, at any timestep, with ComfyUI
+  core's frame interpolation models (RIFE 4.25, FILM for large motion; both MIT/Apache).
+- **AutoMatte: Relight Plan / Relight Guide / Relight Restore**: time of day and sun direction with Lightricks' LTX
+  IC-LoRAs: the light-ball reference built on the server from baked renders (`assets/light_balls/`, from
+  Sphere-Light-Render, MIT, see its NOTICE), detail restore and subject protection after generation.
+- **AutoMatte: Text on Surface**: text, prices or legal supers that stick to a moving surface (planar / cylindrical
+  tracking with OpenCV, drift-free anchoring, occlusion behind the matte, shading and motion blur so it reads as
+  print). Needs `opencv-python-headless` (requirements.txt); without OpenCV the other nodes still load. Fonts:
+  `fonts/` (SIL OFL 1.1, each family's licence as `OFL-<family>.txt`).
+
+No model weights in this pack (torch, plus OpenCV for Text on Surface), so nothing here carries a model licence; the bundled light-ball renders are MIT and the fonts SIL OFL 1.1. Check the licences of the models you
 pair it with.
