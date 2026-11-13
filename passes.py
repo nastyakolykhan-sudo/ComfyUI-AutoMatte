@@ -192,6 +192,10 @@ class AutoMatteMarigoldPasses:
                                                   "tooltip": "Long side the models see (0 = native). 768 is what they were trained for."}),
                 "temporal_blend": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 0.9, "step": 0.01,
                                              "tooltip": "How much of the previous frame's latent starts the next frame (video only)."}),
+                "specular_from_metallic": ("BOOLEAN", {"default": True,
+                                                       "tooltip": "On: specular = mix(0.04, base colour, metallic). Off: every "
+                                                                  "surface is treated as non-metal (0.04), for footage where the "
+                                                                  "metallic guess isn't trusted."}),
             },
         }
 
@@ -200,7 +204,8 @@ class AutoMatteMarigoldPasses:
     FUNCTION = "run"
     CATEGORY = "AutoMatte/Passes"
 
-    def run(self, images, normals_model, material_model, seed, steps, processing_resolution, temporal_blend):
+    def run(self, images, normals_model, material_model, seed, steps, processing_resolution, temporal_blend,
+            specular_from_metallic=True):
         n = images.shape[0]
         pbar = comfy.utils.ProgressBar(2 * n)
 
@@ -242,7 +247,7 @@ class AutoMatteMarigoldPasses:
             raise ValueError(f"{material_model} predicts {names}: no roughness/metallic")
 
         base = albedo.permute(0, 2, 3, 1)
-        m = metal[:, :, :, None]
+        m = metal[:, :, :, None] if specular_from_metallic else torch.zeros_like(metal)[:, :, :, None]
         spec_lin = 0.04 * (1 - m) + _srgb_to_lin(base) * m
         spec = _lin_to_srgb(spec_lin)
         grey = lambda x: x[:, :, :, None].repeat(1, 1, 1, 3).contiguous()  # noqa: E731
