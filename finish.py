@@ -186,9 +186,10 @@ class AutoMatteBackgroundSwap:
             "required": {
                 "images": ("IMAGE",),
                 "matte": ("MASK",),
-                "background": ("IMAGE", {"tooltip": "One image or a clip's frames."}),
             },
             "optional": {
+                "background": ("IMAGE", {"lazy": True, "tooltip": "One image or a clip's frames. Not computed when a background video is given."}),
+                "background_video": ("VIDEO", {"tooltip": "A background clip (wins over the image when it is a real file)."}),
                 "light_wrap": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "harmonize": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05}),
             },
@@ -209,8 +210,38 @@ class AutoMatteBackgroundSwap:
         y0, x0 = (nh - h) // 2, (nw - w) // 2
         return t[:, :, y0:y0 + h, x0:x0 + w].permute(0, 2, 3, 1)
 
-    def run(self, images, matte, background, light_wrap=0.35, harmonize=0.3):
+    def check_lazy_status(self, **kw):
+        # ComfyUI passes a linked-but-unevaluated lazy input as None and leaves an unlinked one out: only ask for the
+        # image when it is linked, missing, and no background video is given
+        from .layers import _video_given
+        if _video_given(kw.get("background_video")):
+            return []
+        return ["background"] if "background" in kw and kw["background"] is None else []
+
+    def _read_video(self, video, n, h, w):
+        """Background clip frames scaled to cover h x w while decoding (at most n frames; light on memory)."""
+        frames = []
+        try:
+            import av
+            with av.open(video.get_stream_source(), mode="r") as c:
+                for fr in c.decode(c.streams.video[0]):
+                    t = torch.from_numpy(fr.to_ndarray(format="rgb24")).float()[None] / 255.0
+                    frames.append(self._cover(t, h, w)[0])
+                    if len(frames) >= n:
+                        break
+        except Exception:
+            frames = []
+        if frames:
+            return torch.stack(frames, 0)
+        return self._cover(video.get_components().images[:n, ..., :3].float(), h, w)
+
+    def run(self, images, matte, background=None, background_video=None, light_wrap=0.35, harmonize=0.3):
+        from .layers import _video_given
         n, h, w = images.shape[0], images.shape[1], images.shape[2]
+        if _video_given(background_video):
+            background = self._read_video(background_video, n, h, w)
+        if background is None:
+            raise ValueError("Give a background image or a background video.")
         m = _fit_mask(matte, n, h, w)
         dev = _device()
         short = min(h, w)
