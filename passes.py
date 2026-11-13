@@ -268,8 +268,9 @@ def _turbo(x):
 
 
 class AutoMatteDepthPasses:
-    """Depth renders normalised over the whole clip (not per frame, so nothing pumps): greyscale with near = white,
-    and a heat map (Turbo: near = red, far = dark blue). Takes raw depth (far = larger) or disparity (near = larger)."""
+    """Depth renders normalised over the whole clip (not per frame, so nothing pumps), in log depth so the near subject
+    and the far background both keep their gradation: greyscale with near = white, and a heat map (Turbo: near = red,
+    far = dark blue). Takes raw depth (far = larger) or disparity (near = larger)."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -281,7 +282,7 @@ class AutoMatteDepthPasses:
                 "high_percentile": ("FLOAT", {"default": 99.0, "min": 80.0, "max": 100.0, "step": 0.1}),
                 "align_frames": ("BOOLEAN", {"default": True,
                                              "tooltip": "Per-frame depth models guess each frame's scale on its own: fit "
-                                                        "each frame's scale and offset to the frame before (video)."}),
+                                                        "each frame's scale to the frame before (video)."}),
             },
         }
 
@@ -291,19 +292,16 @@ class AutoMatteDepthPasses:
     CATEGORY = "AutoMatte/Passes"
 
     def run(self, depth, input_is, low_percentile, high_percentile, align_frames=True):
-        d = depth[..., 0].float()
+        d = depth[..., 0].float().clamp_min(1e-6).log()  # log space: near and far both keep gradation
         if input_is.startswith("depth"):
-            d = 1.0 / d.clamp_min(1e-6)  # to disparity: spreads near detail like a depth pass reads
+            d = -d  # log disparity: near = larger
         if align_frames and d.shape[0] > 1:
+            # A per-frame depth model guesses each frame's scale on its own; in log space that's an offset. Fit it to
+            # the frame before with the median difference (a moving subject or a new area doesn't pull it).
             d = d.clone()
             step = max(1, int((d.shape[1] * d.shape[2] / 65536) ** 0.5))
             for i in range(1, d.shape[0]):
-                x, y = d[i, ::step, ::step].flatten(), d[i - 1, ::step, ::step].flatten()
-                xm, ym = x.mean(), y.mean()
-                var = ((x - xm) ** 2).mean()
-                s_ = (((x - xm) * (y - ym)).mean() / var) if var > 1e-12 else torch.tensor(1.0)
-                s_ = s_.clamp(0.5, 2.0)  # a cut or a big move: don't let one fit swing the scale
-                d[i] = s_ * d[i] + (ym - s_ * xm)
+                d[i] = d[i] + (d[i - 1, ::step, ::step] - d[i, ::step, ::step]).median()
         flat = d.flatten()
         if flat.numel() > 4_000_000:
             flat = flat[torch.randperm(flat.numel())[:4_000_000]]
