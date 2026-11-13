@@ -173,14 +173,18 @@ def layer_times(n, fps, fps_out, mode, speed, hero, loop=False):
     """Subject and background source frames for the layer modes, in sync at the hero frame (the anchor: there the
     output is the original frame). Output length = the longest span in which no layer runs out of footage.
     Hero Freeze: both layers play up to the hero frame, then the subject holds while the background plays at `speed`;
-    with a loop only the held part is made (a cinemagraph). Returns (subject, background, anchor output index)."""
+    with a loop (a cinemagraph) the subject is held throughout over the whole background, which Retime then loops. Returns (subject, background, anchor output index)."""
     r = fps / fps_out
     k, last = float(hero), n - 1
     if mode == "Hero Freeze":
         s_bg = speed if speed > 0 else 1.0
-        pre = [] if loop else [k - r * j for j in range(int(math.floor(k / r + 1e-9)), 0, -1)]
-        post = [k + s_bg * r * j for j in range(int(math.floor((last - k) / (s_bg * r) + 1e-9)) + 1)]
-        sub, bg, anchor = pre + [k] * len(post), pre + post, len(pre)
+        if loop:   # cinemagraph: the held subject over a loop that may come from any part of the background
+            bg = [s_bg * r * j for j in range(int(math.floor(last / (s_bg * r) + 1e-9)) + 1)]
+            sub, anchor = [k] * len(bg), None
+        else:
+            pre = [k - r * j for j in range(int(math.floor(k / r + 1e-9)), 0, -1)]
+            post = [k + s_bg * r * j for j in range(int(math.floor((last - k) / (s_bg * r) + 1e-9)) + 1)]
+            sub, bg, anchor = pre + [k] * len(post), pre + post, len(pre)
     else:
         s_sub, s_bg = (speed, 1.0) if mode == "Subject Only" else (1.0, speed)
 
@@ -755,40 +759,123 @@ class _Camera:
 
 
 # ===================================================================================================== loops
-def loop_plan(frames, fps, window=2):
-    """Video-texture loop points on a clip: frames i < j (j - i >= max(half the clip, 1 s)) whose neighbourhoods
-    match best (picture and motion), and the style that hides the seam: 'cut' (seam no bigger than a normal frame
-    step), 'morph' (a short flow-aware bridge) or 'pingpong' (forward then back, eased at the turns)."""
+LOOP_MIN_S = 3.0        # social loops: at least this long, or most of the clip when it is shorter
+
+
+def loop_min_len(n, fps, window=2):
+    """Shortest loop worth making (frames) and why: LOOP_MIN_S seconds, or 80% of what can loop in a shorter clip."""
+    avail = n - 2 * window - 1
+    target = int(round(LOOP_MIN_S * fps))
+    most = int(0.8 * avail)
+    if target <= most:
+        return target, f"at least {LOOP_MIN_S:g} s"
+    return max(2, most), f"most of the clip ({avail / fps:.1f} s can loop)"
+
+
+def camera_move(frames):
+    """Does the camera move noticeably over the clip (a push-in, a pan)? Chained similarity fit (as for the camera
+    lock): zoom over 3%, a pan over 3% of the short side, or roll over 1 degree, anywhere in the clip."""
+    if frames.shape[0] < 3:
+        return False, {}
+    cam = _Camera(frames, short=128)
+    par = cam.par
+    zoom = float(par[:, 0].abs().max())
+    pan = float(par[:, 2:].norm(dim=1).max()) / min(cam.h, cam.w)
+    roll = float(par[:, 1].abs().max())
+    moving = zoom > math.log(1.03) or pan > 0.03 or roll > math.radians(1.0)
+    return moving, {"camera_zoom_max": round(math.exp(zoom), 3), "camera_pan_max_share": round(pan, 3)}
+
+
+CAMERA_EXPLAINS = 0.15  # a fitted camera move must explain at least this share of the frame change to count
+
+
+def camera_share(frames, pairs=12, gap=4, short=128):
+    """How much of the change between frames `gap` apart the fitted camera move explains: about 0 when things move in
+    a still frame (a turntable on a plain backdrop fools the fit itself, so this guards it), higher for a real camera
+    move (a push-in with parallax and small moving things scores about 0.2)."""
     n = frames.shape[0]
+    if n <= gap:
+        return 0.0
+    g = _thumbs(frames, short)
+    dev = _device()
+    H, W = g.shape[1], g.shape[2]
+    y0, y1, x0, x1 = H // 10, H - H // 10, W // 10, W - W // 10
+    shares = []
+    for t in torch.linspace(0, n - 1 - gap, min(pairs, n - gap)).round().long().unique().tolist():
+        a, b = g[t].to(dev), g[t + gap].to(dev)
+        raw = float((a - b).abs()[y0:y1, x0:x1].mean())
+        if raw < 0.003:
+            continue
+        sc, an, dy, dx = similarity(a, b)
+        res = float((warp(a, _mat(sc, an, dy, dx, (H // 2, W // 2))) - b).abs()[y0:y1, x0:x1].mean())
+        shares.append(max(0.0, 1.0 - res / raw))
+    return float(torch.tensor(shares).median()) if shares else 0.0
+
+
+def loop_plan(frames, fps, window=2):
+    """How to loop a clip seamlessly. Loop points ("video textures"): frames i < j at least `loop_min_len` apart whose
+    neighbourhoods match best (picture and motion). Style:
+      cut        the seam is no bigger than a normal frame step;
+      morph      a short flow-aware bridge across a small mismatch;
+      pingpong   forward then back, eased at the turns, when the camera moves (a fitted move that also explains part of
+                 the change): it reads as moving in and back out, where a dissolve would double the whole frame;
+      crossfade  when the frame is still and things move in it (a turntable, water, people keep going forward): the
+                 whole clip, its tail dissolving into its head.
+    A clean loop shorter than the minimum is reported (shorter_clean_loop_s) but not used."""
+    n = frames.shape[0]
+    L_min, why = loop_min_len(n, fps, window)
+    plan = {"min_loop_s": round(L_min / fps, 2), "min_loop_reason": why}
     if n < 2 * window + 4:
-        return {"style": "pingpong", "start": 0, "end": n, "seam_ratio": None}
+        plan.update(style="pingpong", start=0, end=n, seam_ratio=None)
+        return plan
     g = _thumbs(frames, 36).reshape(n, -1)
     D = torch.cdist(g[None], g[None])[0] / math.sqrt(g.shape[1])
     typical = float(torch.diagonal(D, 1).median().clamp_min(1e-6))
     m = n - 2 * window
     S = sum(D[window + k:window + k + m, window + k:window + k + m] for k in range(-window, window + 1)) / (2 * window + 1)
-    min_len = min(m - 1, max(n // 2, int(round(fps))))
     ii = torch.arange(m)[:, None]
     jj = torch.arange(m)[None]
-    S = torch.where(jj >= ii + min_len, S, torch.full_like(S, float("inf")))
-    best = int(torch.argmin(S))
-    i, j = divmod(best, m)
-    i, j = i + window, j + window
-    score = float(S.flatten()[best])
-    if not math.isfinite(score):
-        return {"style": "pingpong", "start": 0, "end": n, "seam_ratio": None}
-    ratio = score / typical
-    far = D[torch.triu(torch.ones(n, n, dtype=torch.bool), diagonal=max(1, min_len))]
-    unrelated = float(far.median()) if far.numel() else score
-    rel = score / max(unrelated, 1e-6)          # vs two unrelated frames of the clip: 1 = no better than random
-    if ratio <= 1.5 and rel <= 0.5:
-        style = "cut"
-    elif ratio <= 6 and rel <= 0.8:
-        style = "morph"
+    far = D[torch.triu(torch.ones(n, n, dtype=torch.bool), diagonal=max(1, L_min))]
+    unrelated = float(far.median()) if far.numel() else float(D.max())
+
+    def best_of(min_len):
+        Sm = torch.where(jj >= ii + min_len, S, torch.full_like(S, float("inf")))
+        b = int(torch.argmin(Sm))
+        sc = float(Sm.flatten()[b])
+        i, j = divmod(b, m)
+        return i + window, j + window, sc
+
+    i, j, score = best_of(L_min)
+    if math.isfinite(score):
+        ratio, rel = score / typical, score / max(unrelated, 1e-6)
+        plan.update(start=i, end=j, seam_ratio=round(ratio, 2), seam_vs_unrelated=round(rel, 3), seam=round(score, 4),
+                    typical_change=round(typical, 4))
+        if ratio <= 1.5 and rel <= 0.5:
+            plan["style"] = "cut"
+            return plan
+        if ratio <= 6 and rel <= 0.8 and i >= 4:
+            plan["style"] = "morph"
+        short = max(4, int(round(0.5 * fps)))
+        if short < L_min:
+            si, sj, ss = best_of(short)
+            if math.isfinite(ss) and ss / typical <= 1.5 and ss / max(unrelated, 1e-6) <= 0.5:
+                plan["shorter_clean_loop_s"] = round((sj - si) / fps, 2)
+        if plan.get("style") == "morph":
+            return plan
     else:
-        style = "pingpong"
-    return {"style": style, "start": i, "end": j, "seam_ratio": round(ratio, 2), "seam_vs_unrelated": round(rel, 3),
-            "seam": round(score, 4), "typical_change": round(typical, 4)}
+        rel = 1.0
+        plan.update(seam_ratio=None)
+    moving, cinfo = camera_move(frames)
+    if moving:
+        cinfo["camera_explains"] = round(camera_share(frames), 2)
+        moving = cinfo["camera_explains"] >= CAMERA_EXPLAINS
+    plan.update(cinfo, camera_moves=moving)
+    if moving:
+        plan.update(style="pingpong", start=0, end=n)
+    else:
+        C = int(min(max(6, round(fps * (0.5 + min(rel, 1.0)))), n // 3, max(4, n - L_min)))
+        plan.update(style="crossfade", start=0, end=n - C, crossfade_frames=C)
+    return plan
 
 
 def loop_frames(R, fps, plan=None):
@@ -796,10 +883,11 @@ def loop_frames(R, fps, plan=None):
     position of each output frame."""
     n = R.n
     plan = plan or loop_plan(R.f, fps)
-    style, i, j = plan["style"], plan["start"], plan["end"]
+    style, i, j = plan["style"], plan.get("start", 0), plan.get("end", n)
     if style == "cut":
         idx = list(range(i, j))
         o, a = R.render([float(x) for x in idx])
+        plan["loop_s"] = round(len(idx) / fps, 2)
         return o, a, plan, [float(x) for x in idx]
     if style == "morph":
         K = int(min(max(4, round(2 * plan["seam_ratio"])), max(4, round(fps / 2)), i, j - i - 1))
@@ -816,7 +904,21 @@ def loop_frames(R, fps, plan=None):
                 o[len(idx) - K + q] = mo
                 if a is not None and ma is not None:
                     a[len(idx) - K + q] = ma
+            plan["loop_s"] = round(len(idx) / fps, 2)
             return o, a, plan, [float(x) for x in idx]
+    if style == "crossfade":
+        # out[q] = frame q for q >= C; the first C frames dissolve from the clip's tail (frames j..n-1, which follow
+        # the last output frame naturally) into its head, so the motion never reverses
+        C = plan["crossfade_frames"]
+        idx = list(range(0, j))
+        o, a = R.render([float(x) for x in idx])
+        for q in range(C):
+            w = (q + 1) / (C + 1)
+            o[q] = (1 - w) * R.f[j + q, ..., :3].float() + w * R.f[q, ..., :3].float()
+            if a is not None:
+                a[q] = (1 - w) * R.a[j + q] + w * R.a[q]
+        plan["loop_s"] = round(len(idx) / fps, 2)
+        return o, a, plan, [float(x) for x in idx]
     # ping-pong over the whole clip, eased so the motion slows to a stop at both turns
     span = n - 1
     fwd = []
@@ -825,7 +927,7 @@ def loop_frames(R, fps, plan=None):
         fwd.append(span * (u - math.sin(2 * math.pi * u) / (2 * math.pi)))
     times = fwd + [span - t for t in fwd]
     o, a = R.render(times)
-    plan.update(style="pingpong", start=0, end=n)
+    plan.update(style="pingpong", start=0, end=n, loop_s=round(len(times) / fps, 2))
     return o, a, plan, times
 
 
@@ -1554,8 +1656,19 @@ class AutoMatteRetime:
         if "loop" in rep:
             rep["frames_out"] = out.shape[0]
             rep["seconds_out"] = round(out.shape[0] / tm["fps_out"], 3)
-            if rep["loop"].get("seam_ratio") is not None and rep["loop"]["style"] == "pingpong":
-                rep["notes"].append("No matching loop points: the loop plays forward then back")
+            lp = rep["loop"]
+            sec = lp.get("loop_s", rep["seconds_out"])
+            what = {"cut": f"Loop of {sec} s, a plain cut (the seam matches)",
+                    "morph": f"Loop of {sec} s with a {lp.get('bridge_frames')}-frame bridge across the seam",
+                    "crossfade": f"Loop of {sec} s: no matching loop point and things move in the frame, so the last "
+                                 f"{lp.get('crossfade_frames')} frames dissolve into the start (the motion keeps going "
+                                 "forward)",
+                    "pingpong": f"Loop of {sec} s: no matching loop point and the camera moves, so it plays forward "
+                                "then back"}[lp["style"]]
+            rep["notes"].append(f"{what}; minimum loop length {lp.get('min_loop_s')} s ({lp.get('min_loop_reason')})")
+            if lp.get("shorter_clean_loop_s"):
+                rep["notes"].append(f"A clean {lp['shorter_clean_loop_s']} s loop exists but is shorter than the "
+                                    "minimum: not used")
         if ip is not None:
             rep["interp"] = {"model": ip.kind, "matte_same_flow": bool(ip.co_warp), "frame_pairs": ip.pairs,
                              "in_betweens": ip.made}
