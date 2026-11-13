@@ -46,10 +46,12 @@ def _dilate(m, r):
 
 
 class AutoMatteEffectZone:
-    """Where an object's shadow, caustic or reflection can fall: the object plus an ellipse around where it meets the
-    surface (the bottom of its mask), wide_factor x its width across and depth_factor x its height deep, never above
-    the lower part of the object. Sized per frame from the object and smoothed over +-4 frames. `images` sets the
-    output size and frame count (e.g. frames padded for a model: the mask's last frame is repeated)."""
+    """Where an object's shadow, caustic or reflection can fall, so a generative fill may rebuild it: the object plus
+    an ellipse around where it meets the surface (the bottom of its mask), wide_factor x its width across and
+    depth_factor x its height deep, never above the lower part of the object. Sized per frame and smoothed over
+    +-4 frames; anything in `protect` (grown a little) stays out. `enabled` off = the object only (e.g. when the object casts no visible effect: a bigger rebuild area
+    only invites the fill to invent things). `images` sets the output size and frame count (e.g. frames padded for a
+    model: the mask's last frame is repeated)."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -59,8 +61,10 @@ class AutoMatteEffectZone:
                 "images": ("IMAGE", {"tooltip": "Frames that set the output size and frame count."}),
             },
             "optional": {
-                "wide_factor": ("FLOAT", {"default": 1.4, "min": 0.0, "max": 6.0, "step": 0.05, "tooltip": "Half-width of the area around the base, in object widths."}),
-                "depth_factor": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 3.0, "step": 0.05, "tooltip": "Half-height of the area around the base, in object heights."}),
+                "enabled": ("BOOLEAN", {"default": True, "tooltip": "Off = the object only."}),
+                "protect": ("MASK", {"lazy": True, "tooltip": "Other things the fill must not rebuild (e.g. objects next to this one); only computed when enabled."}),
+                "wide_factor": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 6.0, "step": 0.05, "tooltip": "Half-width of the area around the base, in object widths."}),
+                "depth_factor": ("FLOAT", {"default": 0.45, "min": 0.0, "max": 3.0, "step": 0.05, "tooltip": "Half-height of the area around the base, in object heights."}),
             },
         }
 
@@ -69,9 +73,20 @@ class AutoMatteEffectZone:
     FUNCTION = "run"
     CATEGORY = "AutoMatte/Layers"
 
-    def run(self, subject, images, wide_factor=1.4, depth_factor=0.6):
+    def check_lazy_status(self, **kw):
+        if not kw.get("enabled", True):
+            return []
+        return ["protect"] if "protect" in kw and kw["protect"] is None else []
+
+    def run(self, subject, images, enabled=True, protect=None, wide_factor=1.0, depth_factor=0.45):
         n, h, w = images.shape[0], images.shape[1], images.shape[2]
         m = _fit_mask(subject, n, h, w)
+        if not enabled:
+            return ((m > 0.5).float().contiguous(),)
+        keep_out = None
+        if protect is not None:
+            pr = _fit_mask(protect, n, h, w)
+            keep_out = _dilate((pr > 0.5).float(), max(2, round(0.015 * min(h, w)))) > 0.5
         boxes = _bbox_track(m)
         yy = torch.arange(h, dtype=torch.float32)[:, None]
         xx = torch.arange(w, dtype=torch.float32)[None, :]
@@ -85,8 +100,10 @@ class AutoMatteEffectZone:
             bb = depth_factor * ho + 0.02 * h
             cx = (x0 + x1) / 2
             e = (((xx - cx) / a) ** 2 + ((yy - y1) / bb) ** 2) <= 1
-            e = e & (yy >= y1 - 0.4 * ho)
-            zone[i] = e.float()
+            zi = e & (yy >= y1 - 0.4 * ho)
+            if keep_out is not None:
+                zi = zi & ~keep_out[i]
+            zone[i] = zi.float()
         return (torch.maximum(zone, (m > 0.5).float()).contiguous(),)
 
 
@@ -109,7 +126,7 @@ class AutoMatteEffectMask:
             },
             "optional": {
                 "object_grow": ("FLOAT", {"default": 0.03, "min": 0.0, "max": 0.2, "step": 0.005, "tooltip": "How far around the object is always pasted, as a fraction of the shorter side."}),
-                "reach": ("FLOAT", {"default": 1.2, "min": 0.0, "max": 6.0, "step": 0.1, "tooltip": "How far an effect may extend from the object, in object widths."}),
+                "reach": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 6.0, "step": 0.1, "tooltip": "How far an effect may extend from the object, in object widths."}),
                 "sensitivity": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 4.0, "step": 0.05, "tooltip": "Above 1 finds fainter effects; below 1 only strong ones."}),
             },
         }
@@ -119,7 +136,7 @@ class AutoMatteEffectMask:
     FUNCTION = "run"
     CATEGORY = "AutoMatte/Layers"
 
-    def run(self, images, generated, subject, zone, object_grow=0.03, reach=1.2, sensitivity=1.0):
+    def run(self, images, generated, subject, zone, object_grow=0.03, reach=0.8, sensitivity=1.0):
         n, h, w = images.shape[0], images.shape[1], images.shape[2]
         if generated.shape[1:3] != (h, w):
             generated = _resize_frames(generated[..., :3], h, w, "bilinear")
@@ -131,6 +148,7 @@ class AutoMatteEffectMask:
         dev = _device()
         short = min(h, w)
         r_lp = max(3, round(0.012 * short))
+        r1 = max(1, round(0.002 * short))
         r_obj = max(2, round(object_grow * short))
         boxes = _bbox_track(subj)
         s = 4  # connection is followed on a 1/4 grid
@@ -139,8 +157,10 @@ class AutoMatteEffectMask:
         thr_l, thr_c, frames_fx = [], [], 0
         for i in range(0, n, CHUNK):
             j = min(n, i + CHUNK)
-            o = srgb_to_ok(images[i:j, ..., :3].to(dev).float())
-            g = srgb_to_ok(generated[i:j, ..., :3].to(dev).float())
+            orr = images[i:j, ..., :3].to(dev).float()
+            gr = generated[i:j, ..., :3].to(dev).float()
+            o = srgb_to_ok(orr)
+            g = srgb_to_ok(gr)
             d = _box(_box(g - o, r_lp), r_lp)
             dl, dc = d[..., 0].abs(), torch.hypot(d[..., 1], d[..., 2])
             sm = subj[i:j].to(dev)
@@ -164,6 +184,18 @@ class AutoMatteEffectMask:
                 thr_l.append(tl)
                 thr_c.append(tc)
                 cand = cand_zone & ((dl[k] > tl) | (dc[k] > tc))
+                # only a change of light: the fill may be lighter with the same detail (a shadow taken away) or
+                # simpler (a caustic or glint taken away); new or changed things carry their own detail
+                Lo, Lg = o[k:k + 1, ..., 0], g[k:k + 1, ..., 0]
+                so_ = _box((_box(Lo, r1) - _box(Lo, r_lp)).abs(), r_lp)[0]
+                sg_ = _box((_box(Lg, r1) - _box(Lg, r_lp)).abs(), r_lp)[0]
+                gain = _box(gr[k:k + 1], r_lp) / _box(orr[k:k + 1], r_lp).clamp_min(1e-3)
+                res = _box((gr[k:k + 1] - orr[k:k + 1] * gain).abs().mean(-1), r_lp)[0]
+                ref_res = float(res[ref].median()) if bool(ref.any()) else 0.01
+                lighter = d[k, ..., 0] > 0
+                shadow_like = (res < max(0.012, 1.8 * ref_res)) & lighter
+                simpler = sg_ < 0.75 * so_
+                cand = cand & (sg_ <= so_) & (shadow_like | simpler)
                 # keep what connects to the object, within `reach` object widths
                 a = F.max_pool2d(cand.float()[None, None], s)[0, 0]
                 seed = F.max_pool2d(_dilate(od[k:k + 1].float(), 2)[None], s)[0, 0]
