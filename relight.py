@@ -27,7 +27,7 @@ import torch
 import torch.nn.functional as F
 
 from .nodes import _device, _resize_frames, CHUNK
-from .layers import _video_given, _fit_mask
+from .layers import _video_given, _fit_mask, srgb_to_ok, ok_to_srgb
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 BALL_DIR = os.path.join(_HERE, "assets", "light_balls")
@@ -55,6 +55,10 @@ DIR_PHRASE = {0: "the front", 45: "the front-right", 90: "the right", 135: "the 
               -135: "the back-left", -90: "the left", -45: "the front-left"}
 RELIGHT_TRIGGER = "relight the video to match the light-direction ball."
 NIGHT_TAIL = "Only the lighting changes from day to night; identical composition, framing, camera movement and motion."
+# Night floor (AutoMatteRelightRestore): how far below its day level the scene must end up (median linear-light ratio,
+# sky and black excluded), and the coolest-allowed colour (OKLab b x400; None = keep the model's). Day-for-night
+# practice: about 2.3 stops under for moonlight, less under city lights (lamps and windows are kept as lit).
+NIGHT_FLOOR = {"moon": {"ratio": 0.2, "b_max": 3.0}, "city": {"ratio": 0.3, "b_max": None}}
 NIGHT_STYLE = {
     ("moon", "exterior"): "Photorealistic moonlight with cool blue ambient light and deep natural shadows.",
     ("moon", "interior"): "Dim cool moonlight through the windows, low-key light and deep natural shadows.",
@@ -197,6 +201,7 @@ def make_plan(look, sun_direction, width, height, frames, fps, scene_text="", su
             parts.append(prompt_suffix.strip().rstrip(".") + ".")
         parts.append(NIGHT_TAIL)
         plan.update(prompt=" ".join(parts), rotation=0.0, elevation=0.0, intensity=0.0, ball=None,
+                    night_floor=dict(NIGHT_FLOOR[L["style"]]),
                     sun_direction="(not used at night)", lora="ltx-2.5-22b-ic-lora-day-to-night-0.9.safetensors",
                     tile_frames=window_frames(n8, 97))
         strip = 0
@@ -431,6 +436,73 @@ def structure_lock(src_srgb, out_srgb, short=256):
     return (a * b).sum(1) / (a.norm(dim=1) * b.norm(dim=1)).clamp_min(1e-8)
 
 
+def _smooth(x, e0, e1):
+    t = ((x - e0) / (e1 - e0)).clamp(0, 1)
+    return t * t * (3 - 2 * t)
+
+
+def _night_maps(s_srgb, r_srgb, floor, g_clip, short=128):
+    """Per-pixel night-floor gain and lit-source weight, at a small size (smooth by construction), for (N,H,W,3)
+    source and relit frames of the same size: ratio = local relit / local source level (linear light);
+    gain = clamp(floor / ratio, g_clip, 1); pixels the night made brighter than the day (lamps, windows) keep 1."""
+    n, h, w = s_srgb.shape[:3]
+    sc = min(1.0, short / min(h, w))
+    hh, ww = max(8, round(h * sc)), max(8, round(w * sc))
+    def lvl(x):
+        y = _luma(_lin(x)).float()
+        y = F.interpolate(y[:, None], size=(hh, ww), mode="area")[:, 0]
+        return _gauss(y, 0.02 * min(hh, ww) + 0.5)
+    ys, yr = lvl(s_srgb), lvl(r_srgb)
+    ratio = yr / ys.clamp_min(1e-3)
+    lit = _smooth(ratio, 0.9, 1.4)
+    gain = (floor / ratio.clamp_min(1e-4)).clamp(min=g_clip, max=1.0)
+    gain = gain + (1 - gain) * lit
+    return ys, ratio, gain, lit
+
+
+def night_floor_stats(images, rel, floor, b_max, frames=24):
+    """Clip-level night floor: the median relit/source ratio over the scene (sky, near-black and lit sources out),
+    the clip gain that brings it down to `floor` (1 = the model's night is already dark enough) and the cool shift
+    for the colour (0 when the night is already cool enough). One set of numbers per clip: no flicker."""
+    n = images.shape[0]
+    idx = torch.linspace(0, n - 1, min(n, frames)).round().long().unique()
+    s = images[idx, ..., :3].float()
+    r = _resize_frames(rel[idx].float(), s.shape[1], s.shape[2], "bilinear").clamp(0, 1)
+    ys, ratio, _, lit = _night_maps(s, r, floor, 0.0)
+    valid = (ys > 0.01) & (ys < 0.5) & (lit < 0.5)
+    if int(valid.sum()) < max(16, 0.01 * valid.numel()):
+        return {"applied": False, "reason": "too little mid-tone scene to measure"}
+    med = float(ratio[valid].median())
+    g = min(1.0, floor / max(med, 1e-4))
+    shift = 0.0
+    b_mean = None
+    if b_max is not None:  # measured after the exposure pull (OKLab b shrinks with lightness)
+        _, _, gain, _ = _night_maps(s, r, floor, g)
+        sm = F.interpolate(r.permute(0, 3, 1, 2), size=valid.shape[1:], mode="area").permute(0, 2, 3, 1)
+        ok = srgb_to_ok(_srgb(_lin(sm) * gain[..., None]))
+        b_mean = float(ok[..., 2][valid].mean())
+        shift = min(10.0, max(0.0, b_mean - b_max))
+    return {"applied": g < 0.98 or shift > 0.5, "ratio_median": round(med, 3), "floor": floor,
+            "clip_gain": round(g, 3), "b_mean": None if b_mean is None else round(b_mean, 2),
+            "b_shift": round(shift, 2)}
+
+
+def apply_night_floor(s_srgb, r_srgb, nf):
+    """Pull a too-bright night down to the floor (per pixel, never below the clip gain, lit sources kept) and cool
+    it by the clip's shift (lit sources keep their colour). Returns relit sRGB."""
+    if not nf.get("applied"):
+        return r_srgb
+    _, _, gain, lit = _night_maps(s_srgb, r_srgb, nf["floor"], nf["clip_gain"])
+    h, w = r_srgb.shape[1:3]
+    up = lambda x: F.interpolate(x[:, None], size=(h, w), mode="bilinear", align_corners=False)[:, 0][..., None]
+    out = _srgb(_lin(r_srgb) * up(gain))
+    if nf.get("b_shift", 0) > 0:
+        ok = srgb_to_ok(out)
+        ok[..., 2] = ok[..., 2] - nf["b_shift"] * (1 - up(lit)[..., 0])
+        out = ok_to_srgb(ok)
+    return out
+
+
 SUBJECT_LIGHT_OPTIONS = "Match the New Light, Keep as Shot"
 
 
@@ -480,10 +552,14 @@ class AutoMatteRelightRestore:
         m = None
         if plan.get("protect") and matte is not None:
             m = _fit_mask(matte, n, h, w)
+        nf = {"applied": False}
+        if night and plan.get("night_floor"):
+            nf = night_floor_stats(images, rel, plan["night_floor"]["ratio"], plan["night_floor"]["b_max"])
         dev, out, lock = _device(), [], []
         for i in range(0, n, CHUNK):
             s = images[i:i + CHUNK, ..., :3].to(dev).float()
             r = _resize_frames(rel[i:i + CHUNK], h, w, "bicubic").to(dev).float().clamp(0, 1)
+            r = apply_night_floor(s, r, nf)
             s_lin, r_lin = _lin(s), _lin(r)
             ys, yr = _luma(s_lin), _luma(r_lin)
             yo = yr if sig_g == 0 else _gauss(yr, sig_g) * _detail_ratio(ys, sig_g, 0.25, 4.0, night)
@@ -510,6 +586,8 @@ class AutoMatteRelightRestore:
                    matte_used=m is not None, detail_sigma_frame=round(sig_g, 2), detail_sigma_subject=round(sig_s, 2),
                    structure_lock_mean=round(mean, 3), structure_lock_min=round(float(lk.min()), 3),
                    structure_lock_flagged_frames=flagged[:50])
+        if night:
+            rep["night_floor"] = nf
         if plan.get("ball"):
             rep["ball"] = dict(plan["ball"], file=os.path.basename(ball_file(plan["rotation"], plan["elevation"],
                                                                                plan["intensity"])[0]))
