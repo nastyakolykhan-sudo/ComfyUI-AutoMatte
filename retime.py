@@ -971,13 +971,19 @@ def hero_freeze_frame(images, matte, given=None):
     return idx[int(torch.argmax(score))], True
 
 
-def peak_motion_frame(images):
+def peak_motion_frame(images, lo=0.2, hi=0.8):
+    """The ramp's hero moment: the frame of peak motion within the middle of the clip (by default its middle 60%), so
+    a Slow at Hero Frame ramp always has room to slow down and speed up again (an action that peaks in the last frames,
+    a kettle lifted away after the pour, would otherwise end the clip in slow motion)."""
     g = _thumbs(images)
-    if g.shape[0] < 2:
+    n = g.shape[0]
+    if n < 2:
         return 0
     d = (g[1:] - g[:-1]).abs().mean((1, 2))
     d = F.avg_pool1d(d[None, None], 5, 1, 2, count_include_pad=False)[0, 0]
-    return int(torch.argmax(d))
+    a = min(int(lo * (n - 1)), n - 2)
+    b = max(int(hi * (n - 1)), a + 1)
+    return a + int(torch.argmax(d[a:b]))
 
 
 def measure_motion(images, pairs=24, tiles=3, short=128):
