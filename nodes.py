@@ -66,8 +66,9 @@ def _resize_frames(x_nhwc, h, w, mode):
     if x_nhwc.shape[1] == h and x_nhwc.shape[2] == w:
         return x_nhwc
     dev, out = _device(), []
-    for i in range(0, x_nhwc.shape[0], CHUNK):
-        t = x_nhwc[i:i + CHUNK].to(dev).permute(0, 3, 1, 2).float()
+    ck = chunk_frames(max(x_nhwc.shape[1], h), max(x_nhwc.shape[2], w))   # by pixels: 1 frame at 4K, 8 at HD
+    for i in range(0, x_nhwc.shape[0], ck):
+        t = x_nhwc[i:i + ck].to(dev).permute(0, 3, 1, 2).float()
         kw = {"antialias": True} if mode in ("bilinear", "bicubic") else {}
         t = F.interpolate(t, size=(h, w), mode=mode, align_corners=False if mode != "area" else None, **kw)
         out.append(t.permute(0, 2, 3, 1).cpu())
@@ -80,8 +81,9 @@ def _morph(mask_nhw, radius, op):
         return mask_nhw
     k = 2 * radius + 1
     dev, out = _device(), []
-    for i in range(0, mask_nhw.shape[0], CHUNK):
-        t = mask_nhw[i:i + CHUNK].to(dev).float()[:, None]
+    ck = chunk_frames(mask_nhw.shape[1], mask_nhw.shape[2])
+    for i in range(0, mask_nhw.shape[0], ck):
+        t = mask_nhw[i:i + ck].to(dev).float()[:, None]
         if op == "dil":
             t = F.max_pool2d(t, k, stride=1, padding=radius)
         else:
