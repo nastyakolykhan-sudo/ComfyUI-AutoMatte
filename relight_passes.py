@@ -18,8 +18,9 @@ How it works, per frame, at a processing size (the light is smooth, so it's comp
    (the passes are estimated per frame; the light should only change where something moves), and sky (the far end of
    the depth pass, if bright) takes the Look's sky tint instead of being shaded.
 
-Torch, plus OpenCV's optical flow when present (a pack requirement); no model weights. Pass-agnostic: any normal (camera space, (n+1)/2), sRGB base colour and near = 1 depth
-works. Night looks are not handled here (Relight's Day-to-Night route does them).
+Torch, plus OpenCV's optical flow when present (a pack requirement); no model weights. Pass-agnostic: any normal
+(camera space, (n+1)/2), sRGB base colour and near = 1 depth works. Night looks are not handled here (Relight's
+Day-to-Night route does them).
 """
 
 import json
@@ -34,27 +35,35 @@ except Exception:          # noqa: BLE001
     cv2 = None
 
 from .nodes import _device, _resize_frames, CHUNK
-from .layers import _box
+from .layers import _box, _fit_mask
 from .relight import _lin, _srgb, _luma, _gauss, _key, structure_lock
 
 # Look -> light. sun / sky / ground colours are linear RGB multipliers; wrap softens the terminator (0 = hard);
 # hardness sets the shadow penumbra (high = crisp); shadow = how dark full shadow gets (1 = only fill remains);
-# exposure = the clip's median brightness relative to the source; sky_tint multiplies the sky.
+# exposure = the clip's median brightness relative to the source; sky_tint multiplies the sky; white / black = the
+# clip's bright and dark ends relative to the source's contrast around the new median (1 = the shot's own contrast).
 LIGHT_LOOKS = {
     "golden hour": dict(sun=(1.00, 0.66, 0.36), sun_k=2.3, sky=(0.33, 0.40, 0.62), sky_k=0.45, ground=(0.45, 0.30, 0.18),
-                        ground_k=0.22, wrap=0.05, hardness=14.0, shadow=1.0, exposure=0.95, sky_tint=(1.18, 0.92, 0.70)),
+                        ground_k=0.22, wrap=0.05, hardness=14.0, shadow=1.0, exposure=0.95, sky_tint=(1.18, 0.92, 0.70),
+                    white=1.0, black=1.0),
     "warm afternoon": dict(sun=(1.00, 0.84, 0.62), sun_k=2.1, sky=(0.42, 0.50, 0.70), sky_k=0.50, ground=(0.40, 0.33, 0.25),
-                           ground_k=0.22, wrap=0.12, hardness=10.0, shadow=0.95, exposure=1.0, sky_tint=(1.08, 1.0, 0.90)),
+                           ground_k=0.22, wrap=0.12, hardness=10.0, shadow=0.95, exposure=1.0, sky_tint=(1.08, 1.0, 0.90),
+                    white=1.0, black=1.0),
     "midday sun": dict(sun=(1.00, 0.97, 0.92), sun_k=2.5, sky=(0.48, 0.60, 0.86), sky_k=0.55, ground=(0.38, 0.36, 0.33),
-                       ground_k=0.20, wrap=0.0, hardness=24.0, shadow=1.0, exposure=1.05, sky_tint=(0.95, 1.0, 1.10)),
+                       ground_k=0.20, wrap=0.0, hardness=24.0, shadow=1.0, exposure=1.05, sky_tint=(0.95, 1.0, 1.10),
+                    white=1.04, black=0.92),
     "low sun": dict(sun=(1.00, 0.86, 0.70), sun_k=2.4, sky=(0.40, 0.48, 0.70), sky_k=0.45, ground=(0.40, 0.32, 0.24),
-                    ground_k=0.22, wrap=0.02, hardness=20.0, shadow=1.0, exposure=0.95, sky_tint=(1.06, 0.98, 0.92)),
+                    ground_k=0.22, wrap=0.02, hardness=20.0, shadow=1.0, exposure=0.95, sky_tint=(1.06, 0.98, 0.92),
+                    white=1.0, black=0.95),
     "soft daylight": dict(sun=(1.00, 0.97, 0.94), sun_k=1.1, sky=(0.60, 0.67, 0.82), sky_k=0.95, ground=(0.40, 0.38, 0.35),
-                          ground_k=0.30, wrap=0.45, hardness=4.0, shadow=0.6, exposure=1.0, sky_tint=(1.0, 1.0, 1.04)),
-    "overcast": dict(sun=(0.90, 0.92, 0.96), sun_k=0.35, sky=(0.72, 0.76, 0.83), sky_k=1.15, ground=(0.38, 0.38, 0.38),
-                     ground_k=0.35, wrap=0.8, hardness=2.5, shadow=0.35, exposure=0.9, sky_tint=(0.92, 0.95, 1.0)),
+                          ground_k=0.30, wrap=0.45, hardness=4.0, shadow=0.6, exposure=1.0, sky_tint=(1.0, 1.0, 1.04),
+                    white=0.97, black=1.0),
+    "overcast": dict(sun=(0.94, 0.95, 0.97), sun_k=0.35, sky=(0.74, 0.76, 0.80), sky_k=1.15, ground=(0.38, 0.38, 0.38),
+                     ground_k=0.35, wrap=0.8, hardness=2.5, shadow=0.35, exposure=0.9, sky_tint=(0.92, 0.95, 1.0),
+                    white=0.93, black=1.03),
     "backlit": dict(sun=(1.00, 0.80, 0.55), sun_k=2.6, sky=(0.32, 0.38, 0.56), sky_k=0.50, ground=(0.42, 0.32, 0.22),
-                    ground_k=0.25, wrap=0.0, hardness=16.0, shadow=1.0, exposure=0.85, sky_tint=(1.15, 0.95, 0.78)),
+                    ground_k=0.25, wrap=0.0, hardness=16.0, shadow=1.0, exposure=0.85, sky_tint=(1.15, 0.95, 0.78),
+                    white=1.0, black=1.0),
 }
 DEFAULT_LOOK = "golden hour"
 STEADY_SIGMA = 0.08  # source log-luminance change that counts as "the picture changed here" (grain is ~0.02)
@@ -65,6 +74,14 @@ SHADOW_BIAS = 0.03   # log distance: a surface must stand this much in front of 
 SHADOW_THICKNESS = 0.10  # ... and no more than this (~10% nearer): things have a thickness; one far in front doesn't
 SHADOW_REACH = 0.5   # how far the shadow rays go, as a share of the width (long low-sun shadows)
 SHADOW_STEPS = 96
+OLD_TINT_SHARE = 0.5  # share of the old light's colour divided out: whites that read warm may be cream objects, and
+#                        with a cool look on top, pastel colours would go grey
+SHOT_RADIUS = 0.04   # light as shot: smoothing radius, as a share of the processing width ...
+SHOT_EPS = 0.02      # ... and how much log-luminance variation of the source counts as an edge it keeps
+TONE_MAX_SLOPE = 1.35  # the most the tone match widens contrast (more brings up the source's grain and
+#                         compression blocks on flat areas)
+NORMAL_DETAIL = 0.4  # share of the normal pass's fine detail the light sees (grooves and estimator blotches)
+NORMAL_RADIUS = 0.012  # size of that detail, as a share of the processing width
 
 
 SIDE_PULL = 20.0   # a pure side sun (rotation +-90) is pulled this far toward the camera, as a 3/4 key
@@ -85,6 +102,14 @@ def light_vector(rotation, elevation):
     convention: rotation 0 = from the camera side, 90 = from the right, 180 = from behind, -90/270 = from the left."""
     az, el = math.radians(float(rotation)), math.radians(float(elevation))
     return (math.cos(el) * math.sin(az), math.sin(el), math.cos(el) * math.cos(az))
+
+
+def _far_floor(depth):
+    """Per frame, the far end of the depth pass (its 0.5th percentile): (N,H,W) -> (N,)."""
+    n = depth.shape[0]
+    flat = depth.reshape(n, -1)
+    flat = flat[:, :: max(1, flat.shape[1] // 200000)].float()
+    return torch.quantile(flat, 0.005, dim=1)
 
 
 def focal_px(w):
@@ -128,7 +153,7 @@ def depth_log_range(normal, depth, f):
     return float(min(8.0, max(0.5, 1.0 / km))), int(ok.sum())
 
 
-def cast_shadow(depth, L, hardness, log_range, f, steps=None, reach=None):
+def cast_shadow(depth, L, hardness, log_range, f, steps=None, reach=None, far_level=None):
     """Screen-space shadows marched in perspective: from every pixel a ray toward the sun, followed in the image (it
     heads for the sun's vanishing point when the sun is beyond the scene, away from the antisolar point when it's
     behind the camera, straight across for a side sun) with its distance tracked (log depth = -log_range x depth pass).
@@ -144,7 +169,10 @@ def cast_shadow(depth, L, hardness, log_range, f, steps=None, reach=None):
     dev, dt = depth.device, depth.dtype
     logd = -log_range * depth
     flat = logd.reshape(n, -1)
-    far_end = -log_range * SKY_DEPTH                  # the clipped far end of the depth pass: its distance is unknown
+    far_level = SKY_DEPTH if far_level is None else far_level
+    if torch.is_tensor(far_level):                    # per frame
+        far_level = far_level.view(-1, 1, 1)
+    far_end = -log_range * far_level                  # the clipped far end of the depth pass: its distance is unknown
     cx, cy = (w - 1) / 2, (h - 1) / 2
     py = torch.arange(h, device=dev, dtype=dt).view(1, h, 1).expand(n, h, w).clone()
     px = torch.arange(w, device=dev, dtype=dt).view(1, 1, w).expand(n, h, w).clone()
@@ -174,8 +202,9 @@ def cast_shadow(depth, L, hardness, log_range, f, steps=None, reach=None):
 
 
 def _guided_log_ratio(guide, num, den, r, eps=1e-3):
-    """Light as shot, smoothed along the guide's edges: exp(guided(log(num / den))), so it follows geometry (the depth
-    pass) instead of texture and doesn't bleed across a silhouette. (N,H,W) in, (N,H,W) out, unclamped."""
+    """Light as shot = exp(guided(log(num / den))) with the source's log luminance as the guide: it keeps only what the
+    picture explains (an old shadow edge darkens both), and flattens what it doesn't (blotches the base colour pass
+    invents on a plain backdrop; print, which both carry, stays flat in the ratio). (N,H,W) in and out, unclamped."""
     p = torch.log(num.clamp_min(1e-4) / den.clamp_min(0.02))
     mi, mp = _box(guide, r), _box(p, r)
     a = (_box(guide * p, r) - mi * mp) / (_box(guide * guide, r) - mi * mi + eps)
@@ -183,11 +212,32 @@ def _guided_log_ratio(guide, num, den, r, eps=1e-3):
     return torch.exp(_box(a, r) * guide + _box(b, r))
 
 
-def new_light(normal, depth, L, look, proc_w, log_range=None):
+def _guided_lin(guide, p, r, eps):
+    """Guided filter of p (N,H,W) along the guide's edges, unclamped."""
+    mi, mp = _box(guide, r), _box(p, r)
+    a = (_box(guide * p, r) - mi * mp) / (_box(guide * guide, r) - mi * mi + eps)
+    b = mp - a * mi
+    return _box(a, r) * guide + _box(b, r)
+
+
+def soften_normals(N, depth, proc_w):
+    """Keep NORMAL_DETAIL of the normal pass's fine detail: the base is smoothed along the depth pass's edges (so
+    silhouettes stay sharp), the rest (plank grooves, estimator blotches on flat panels, cloth wrinkles) is turned
+    down, since a grazing sun would engrave every bump of it. N (N,H,W,3) unit, returns unit."""
+    r = max(2, round(NORMAL_RADIUS * proc_w))
+    base = torch.stack([_guided_lin(depth, N[..., c], r, 1e-4) for c in range(3)], -1)
+    out = base + NORMAL_DETAIL * (N - base)
+    return out / out.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+
+
+def new_light(normal, depth, L, look, proc_w, log_range=None, far_level=None):
     """(N,H,W,3) linear light from the look's sun + hemisphere fill, with cast shadows; and the shadow map.
-    log_range: the depth pass's log scale (depth_log_range); estimated from these frames when not given."""
+    log_range: the depth pass's log scale (depth_log_range); estimated from these frames when not given.
+    far_level: the depth pass value below which it's the clipped far end, a number or one per frame (default
+    SKY_DEPTH)."""
     N = normal * 2 - 1
     N = N / N.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    N = soften_normals(N, depth, proc_w)
     Lt = torch.tensor(L, dtype=N.dtype, device=N.device)
     ndl = (N * Lt).sum(-1)
     wrap = look["wrap"]
@@ -195,7 +245,7 @@ def new_light(normal, depth, L, look, proc_w, log_range=None):
     f = focal_px(proc_w)
     if log_range is None:
         log_range = depth_log_range(normal, depth, f)[0]
-    sh = cast_shadow(depth, L, look["hardness"], log_range, f)
+    sh = cast_shadow(depth, L, look["hardness"], log_range, f, far_level=far_level)
     sh = 1 - look["shadow"] * (1 - sh)
     up = ((N[..., 1] + 1) / 2)[..., None]            # hemisphere fill: sky from above, bounce from below
     t = lambda c: torch.tensor(c, dtype=N.dtype, device=N.device)  # noqa: E731
@@ -294,17 +344,29 @@ class AutoMatteRelightFromPasses:
                 "temporal_smoothing": ("INT", {"default": 12, "min": 0, "max": 24,
                                                "tooltip": "About how many frames the light is steadied over, following "
                                                           "the motion (0 = off)."}),
+                "matte": ("MASK", {"lazy": True, "tooltip": "Subject matte (e.g. AutoMatte Given or Made); only "
+                                                            "computed for Keep as Shot when the plan keeps a subject."}),
+                "subject_light": ("STRING", {"forceInput": True,
+                                             "tooltip": "Match the New Light, or Keep as Shot (the subject stays as "
+                                                        "filmed)."}),
             },
         }
 
     RETURN_TYPES = ("IMAGE", "IMAGE", "STRING")
-    RETURN_NAMES = ("images", "light", "report")
+    RETURN_NAMES = ("images", "light", "report")   # light: the new light, grey, at the processing size
     FUNCTION = "run"
     CATEGORY = "AutoMatte/Relight"
 
+    def check_lazy_status(self, images, normal, base_color, depth, plan, **kw):
+        # an optional lazy input is only lazy when linked: request the matte only for Keep as Shot with a subject
+        keep = _key(kw.get("subject_light") or "") == "keep as shot"
+        return ["matte"] if keep and plan.get("protect") and "matte" in kw and kw["matte"] is None else []
+
     def run(self, images, normal, base_color, depth, plan, strength=1.0, processing_long_side=1024,
-            temporal_smoothing=12):
+            temporal_smoothing=12, matte=None, subject_light="Match the New Light"):
         n, h, w = images.shape[0], images.shape[1], images.shape[2]
+        keep = _key(subject_light or "") == "keep as shot"
+        m_keep = _fit_mask(matte, n, h, w) if keep and plan.get("protect") and matte is not None else None
         if plan.get("route") == "night":
             raise ValueError("Relight from Passes makes daylight looks; night looks run on the Day-to-Night route.")
         lk = _key(plan.get("look", "")) or DEFAULT_LOOK
@@ -323,34 +385,47 @@ class AutoMatteRelightFromPasses:
         idx = torch.linspace(0, n - 1, min(n, 16)).round().long().unique()
         s_lin, a_lin = _lin(small(images[idx]).to(dev)), _lin(small(base_color[idx]).to(dev))
         d_s = small(depth[idx], 1)[..., 0].to(dev)
-        ok = (d_s > SKY_DEPTH) & (_luma(a_lin) > 0.03) & (_luma(s_lin) > 0.01)
+        # the far end of the depth pass, per frame: Depth Passes aligns every frame's offset, so the sky (clipped to
+        # the farthest value) sits at each frame's own minimum (0, or a little above after a video file)
+        ok = (d_s > (_far_floor(d_s) + SKY_DEPTH)[:, None, None]) & (_luma(a_lin) > 0.03) & (_luma(s_lin) > 0.01)
         if int(ok.sum()) < 64:
             ok = (_luma(a_lin) > 0.03) & (_luma(s_lin) > 0.01)
-        old_tint = torch.stack([(s_lin[..., c][ok] / a_lin[..., c][ok].clamp_min(1e-3)).median() for c in range(3)])
-        old_tint = old_tint / (old_tint * torch.tensor([0.2126, 0.7152, 0.0722], device=dev)).sum().clamp_min(1e-4)
+        # the old light's colour, read where the base colour is neutral (white, grey: there the source colour IS the
+        # light); coloured surfaces would mislead it, since the base colour pass desaturates them (an olive backdrop
+        # comes out pale green, a pink petal near white). Only OLD_TINT_SHARE of it is divided out.
+        a_srgb = small(base_color[idx]).to(dev)
+        neutral = ok & ((a_srgb.amax(-1) - a_srgb.amin(-1)) < 0.08) & (_luma(a_lin) > 0.02) & (_luma(a_lin) < 0.8) \
+            & (_luma(s_lin) < 0.9)
+        use = neutral if float(neutral.float().mean()) > 0.01 else ok
+        old_tint = torch.stack([(s_lin[..., c][use] / a_lin[..., c][use].clamp_min(1e-3)).median() for c in range(3)])
+        lw = torch.tensor([0.2126, 0.7152, 0.0722], device=dev)
+        old_tint = old_tint / (old_tint * lw).sum().clamp_min(1e-4)
+        old_tint = old_tint ** OLD_TINT_SHARE
+        old_tint = old_tint / (old_tint * lw).sum().clamp_min(1e-4)
         y_med = math.log(float(_luma(s_lin).median().clamp_min(1e-4)))
         sky_gain = torch.tensor(look["sky_tint"], device=dev) / old_tint
         log_range, lr_px = depth_log_range(small(normal[idx]).to(dev), d_s, focal_px(pw))
 
-        def sky_weight(dep, ylog):
-            """Sky = the far end of the depth pass AND brighter than the clip's median (a dim far wall at the end of the
-            depth range stays land); both ramps are soft, so a value near a limit can't flip from frame to frame."""
-            far = (1 - dep / SKY_DEPTH).clamp(0, 1)
+        def sky_weight(dep, ylog, floor):
+            """Sky = the frame's far end of the depth pass AND brighter than the clip's median (a dim far wall at the
+            end of the depth range stays land); both ramps are soft, so a value near a limit can't flip."""
+            far = (1 - (dep - floor[:, None, None]) / SKY_DEPTH).clamp(0, 1)
             bright = ((ylog - y_med - 0.1) / 0.3).clamp(0, 1)
-            return _gauss(far * bright, 1.0)
+            return _gauss(far * bright, max(1.0, 0.006 * pw))
 
         # pass 1, per frame at the processing size (half precision): the land gain = new light / light as shot (smoothed
         # along depth edges), the sky weight, the source's log luminance (temporal weights), new light and shadow
-        r_g = max(3, round(0.02 * pw))
+        r_g = max(3, round(SHOT_RADIUS * pw))
         gains, ysrcs, shades = [], [], []
         for i in range(0, n, CHUNK):
             sl = slice(i, i + CHUNK)
             src, alb = _lin(small(images[sl]).to(dev)), _lin(small(base_color[sl]).to(dev))
             nrm, dep = small(normal[sl]).to(dev), small(depth[sl], 1)[..., 0].to(dev)
-            light, sh = new_light(nrm, dep, L, look, pw, log_range)
-            shot = _guided_log_ratio(dep, _luma(src), _luma(alb), r_g).clamp(0.05, 8)
+            floor = _far_floor(dep)
+            light, sh = new_light(nrm, dep, L, look, pw, log_range, floor + SKY_DEPTH)
             ylog = torch.log(_gauss(_luma(src), 1.0).clamp_min(1e-4))
-            sky = sky_weight(dep, ylog)
+            shot = _guided_log_ratio(ylog, _luma(src), _luma(alb), r_g, SHOT_EPS).clamp(0.05, 8)
+            sky = sky_weight(dep, ylog, floor)
             gains.append((light / (shot[..., None] * old_tint)).half().cpu())
             ysrcs.append(ylog.half().cpu())
             shades.append(torch.stack([_luma(light), sh, sky], -1).half().cpu())
@@ -372,12 +447,41 @@ class AutoMatteRelightFromPasses:
             sky = shade[jj, ..., 2].float().to(dev)[..., None]
             return torch.log((g * k_exp).clamp(0.08, 8.0) * (1 - sky) + sky_gain * sky)
 
+        # tone, once per clip: give back the shot's contrast where the relight squeezed it (pinning only the median
+        # turns sunlit highlights grey and the frame looks milky). Two log slopes, below and above the median, move the
+        # relit 1st / 99th percentiles out to where the source's sit relative to its median (nudged by the look's
+        # black / white), never in. Luminance only (colour ratios kept), one curve for the clip (no pumping).
+        def pct(y):
+            v = y.flatten()[:: max(1, y.numel() // 400000)].float()
+            return [float(torch.quantile(v, q)) for q in (0.01, 0.5, 0.99)]
+        s1, sm, s99 = pct(_luma(src_s).clamp_min(1e-5))
+        o1, om, o99 = pct(_luma(src_s * torch.exp(log_gain(idx))).clamp_min(1e-5))
+        hi_t = min(0.97, om * (s99 / sm) * look["white"])
+        lo_t = om * (s1 / sm) * look["black"]
+        s_hi = math.log(max(hi_t, om * 1.01) / om) / max(1e-3, math.log(max(o99, om * 1.01) / om))
+        s_lo = math.log(min(lo_t, om * 0.99) / om) / min(-1e-3, math.log(min(o1, om * 0.99) / om))
+        # only ever widen a squeezed range: a hard sun is allowed more contrast than the shot had; the top never
+        # pushes past 0.97 (no new clipping)
+        s_hi_cap = math.log(0.97 / om) / max(1e-3, math.log(max(o99, om * 1.01) / om))
+        s_hi = min(TONE_MAX_SLOPE, max(1.0, min(s_hi, max(1.0, s_hi_cap))))
+        s_lo = min(TONE_MAX_SLOPE, max(1.0, s_lo))
+        s_hi, s_lo = 1 + strength * (s_hi - 1), 1 + strength * (s_lo - 1)
+        log_m = math.log(om)
+
+        def tone(o_lin):
+            y = _luma(o_lin).clamp_min(1e-6)
+            ly = torch.log(y) - log_m
+            w = torch.sigmoid(ly / 0.1)                  # smooth hand-over at the median
+            ly2 = ly * (s_lo * (1 - w) + s_hi * w)
+            return o_lin * torch.exp(ly2 - ly)[..., None]
+
         # pass 2: steady the light over time along the motion (the passes are estimated per frame and flicker; the
         # light should only change where something moves), set strength, apply at full size
         sm = int(temporal_smoothing) if n > 1 else 0
         if sm > 0:
             lgain = steady_over_time(n, lambda t: log_gain(torch.tensor([t]))[0], ysrc, sm, STEADY_SIGMA, dev)
-        out, lock, light_out = [], [], []
+        res = torch.empty(n, h, w, 3)                  # filled in place: no second full-size copy at 4K
+        lock, light_out = [], []
         for i in range(0, n, CHUNK):
             j = torch.arange(i, min(i + CHUNK, n))
             lg = lgain[j].float().to(dev) if sm > 0 else log_gain(j)
@@ -385,13 +489,14 @@ class AutoMatteRelightFromPasses:
             src = images[j, ..., :3].to(dev).float()
             g_full = F.interpolate(g.permute(0, 3, 1, 2), size=(h, w), mode="bilinear",
                                    align_corners=False).permute(0, 2, 3, 1)
-            o = _srgb(_lin(src) * g_full)
+            o = _srgb(tone(_lin(src) * g_full))
+            if m_keep is not None:                     # Keep as Shot: the subject's pixels stay as filmed
+                mk = m_keep[j].to(dev)[..., None]
+                o = o * (1 - mk) + src * mk
             lock.append(structure_lock(src, o).cpu())
-            out.append(o.cpu())
+            res[i:i + len(j)] = o.clamp(0, 1).cpu()
             lv = _srgb((shade[j, ..., 0].float().to(dev) / l_top).clamp(0, 1))
-            light_out.append(F.interpolate(lv[:, None], size=(h, w), mode="bilinear",
-                                           align_corners=False)[:, 0, ..., None].expand(-1, -1, -1, 3).cpu())
-        res = torch.cat(out, 0).clamp(0, 1).contiguous()
+            light_out.append(lv[..., None].expand(-1, -1, -1, 3).cpu())   # the light pass stays at the processing size
         light_img = torch.cat(light_out, 0).clamp(0, 1).contiguous()
         shadow = shade[..., 1].float()
         lk_t = torch.cat(lock, 0)
@@ -401,10 +506,14 @@ class AutoMatteRelightFromPasses:
                "old_light_tint": [round(float(v), 3) for v in old_tint], "exposure_gain": round(k_exp, 3),
                "shadow_share": round(float((shadow < 0.5).float().mean()), 3),
                "depth_log_range": round(log_range, 2), "depth_log_range_pixels": lr_px,
+               "tone_slopes": [round(s_lo, 3), round(s_hi, 3)],
+               "subject_light": "Keep as Shot" if keep else "Match the New Light", "matte_used": m_keep is not None,
                "sky_share": round(float((shade[..., 2] > 0.5).float().mean()), 3),
                "structure_lock_mean": round(float(lk_t.mean()), 3), "structure_lock_min": round(float(lk_t.min()), 3),
                "strength": strength, "temporal_smoothing": temporal_smoothing,
                "motion_following": cv2 is not None}
+        if keep and m_keep is None:
+            rep["notes"] = ["Keep as Shot needs a subject; none was found, so the whole frame was relit"]
         return (res, light_img, json.dumps(rep))
 
 
