@@ -18,7 +18,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-from .nodes import _device, _resize_frames, CHUNK
+from .nodes import _device, _resize_frames, chunk_frames, make_room
 from .layers import srgb_to_ok, _fit_mask, _box
 
 
@@ -160,8 +160,10 @@ class AutoMatteEffectMask:
         effect = torch.zeros(n, h, w)
         obj = torch.zeros(n, h, w)
         thr_l, thr_c, frames_fx = [], [], 0
-        for i in range(0, n, CHUNK):
-            j = min(n, i + CHUNK)
+        ck = chunk_frames(h, w)
+        make_room(dev, ck * h * w)
+        for i in range(0, n, ck):
+            j = min(n, i + ck)
             orr = images[i:j, ..., :3].to(dev).float()
             gr = generated[i:j, ..., :3].to(dev).float()
             o = srgb_to_ok(orr)
@@ -384,8 +386,9 @@ class AutoMatteRingMatch:
         boxes = _bbox_track(subj)
         rows = torch.arange(h, dtype=torch.float32)[:, None].expand(h, w)
         gains = [None] * n
-        for i in range(0, n, CHUNK):
-            j = min(n, i + CHUNK)
+        ck = chunk_frames(h, w)
+        for i in range(0, n, ck):
+            j = min(n, i + ck)
             hard = (pm[i:j] > 0.5).float()
             touched = (pm[i:j] > 0.02).float()
             outer = (_dilate(touched, r_gap + r_band) > 0.5) & ~(_dilate(touched, r_gap) > 0.5)
