@@ -18,7 +18,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-from .nodes import _device, _resize_frames, CHUNK
+from .nodes import _device, _resize_frames, CHUNK, GPU_CHUNK_PX, chunk_frames, make_room, progress
 from .layers import srgb_to_ok, ok_to_srgb, _fit_mask, _box
 
 
@@ -40,31 +40,8 @@ def _mask_chunk(matte, i, j, h, w):
     return m.clamp(0, 1)
 
 
-GPU_CHUNK_PX = 8 * 1920 * 1088  # pixels per GPU chunk: 8 HD frames, 1 frame of 4K
-
-
-def _chunk_frames(h, w):
-    """Frames per GPU chunk, by pixels: CHUNK frames at HD, fewer at higher resolutions (8 frames of 4K stalled the
-    node on a worker that still held the matte models in GPU memory)."""
-    return max(1, min(CHUNK, GPU_CHUNK_PX // max(1, h * w)))
-
-
-def _make_room(dev, px):
-    """Ask ComfyUI to unload cached models until a chunk of `px` pixels has room (~40 float32 values per pixel at
-    the peak of a grade)."""
-    try:
-        import comfy.model_management as mm
-        mm.free_memory(px * 160, dev)
-    except Exception:  # unit tests outside ComfyUI
-        pass
-
-
-def _progress(steps):
-    try:
-        import comfy.utils
-        return comfy.utils.ProgressBar(steps)
-    except Exception:  # unit tests outside ComfyUI
-        return None
+# shared with the other layer nodes (nodes.py): GPU chunks sized by pixels, room made before the first chunk
+_chunk_frames, _make_room, _progress = chunk_frames, make_room, progress
 
 
 class AutoMatteLayerGrade:
@@ -364,14 +341,17 @@ class AutoMatteBackgroundSwap:
         sh_dark = []
         # colour statistics for harmonize: subject vs new background (whole clip, OKLab means)
         sub_s, bg_s = [], []
-        for i in range(0, n, CHUNK):
-            j = min(n, i + CHUNK)
+        ck = _chunk_frames(h, w)
+        _make_room(dev, ck * h * w)
+        for i in range(0, n, ck):
+            j = min(n, i + ck)
             mm = m[i:j].to(dev) > 0.5
-            if bool(mm.any()):
-                sub_s.append(srgb_to_ok(images[i:j, ..., :3].to(dev).float())[mm].mean(0).cpu())
+            if bool(mm.any()):   # pixel-weighted: the same mean whatever the chunk size
+                px = srgb_to_ok(images[i:j, ..., :3].to(dev).float())[mm]
+                sub_s.append((px.sum(0).cpu(), px.shape[0]))
         for i in range(0, min(nb, 64), 8):
             bg_s.append(srgb_to_ok(self._cover(background[i:i + 8, ..., :3].to(dev).float(), 256, 256)).reshape(-1, 3).mean(0).cpu())
-        sub_mean = torch.stack(sub_s).mean(0) if sub_s else torch.zeros(3)
+        sub_mean = (torch.stack([s for s, _ in sub_s]).sum(0) / sum(c for _, c in sub_s)) if sub_s else torch.zeros(3)
         bg_mean = torch.stack(bg_s).mean(0) if bg_s else torch.zeros(3)
         shift = torch.zeros(3)
         if harmonize > 0 and sub_s:
@@ -379,8 +359,8 @@ class AutoMatteBackgroundSwap:
             shift[1:] = harmonize * (bg_mean[1:] - sub_mean[1:]) * 0.5            # half of the colour cast
         shift = shift.to(dev)
         out = torch.empty_like(images[..., :3])
-        for i in range(0, n, CHUNK):
-            j = min(n, i + CHUNK)
+        for i in range(0, n, ck):
+            j = min(n, i + ck)
             rgb = images[i:j, ..., :3].to(dev).float()
             mm = m[i:j].to(dev)
             idx = torch.arange(i, j) % nb

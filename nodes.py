@@ -34,7 +34,31 @@ except Exception:  # unit tests outside ComfyUI
     def _device():
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-CHUNK = 8  # frames per GPU chunk
+CHUNK = 8  # frames per GPU chunk at HD; use chunk_frames(h, w) for loops that send whole frames to the GPU
+GPU_CHUNK_PX = 8 * 1920 * 1088  # pixels per GPU chunk: 8 HD frames, 1 frame of 4K
+
+
+def chunk_frames(h, w):
+    """Frames per GPU chunk, by pixels: CHUNK frames at HD, fewer at higher resolutions (8 frames of 4K stalled a
+    layer node on a worker that still held the matte models in GPU memory)."""
+    return max(1, min(CHUNK, GPU_CHUNK_PX // max(1, h * w)))
+
+
+def make_room(dev, px, floats_per_px=40):
+    """Ask ComfyUI to unload cached models until a chunk of `px` pixels has room (float32 temporaries)."""
+    try:
+        import comfy.model_management as mm
+        mm.free_memory(int(px * floats_per_px * 4), dev)
+    except Exception:  # unit tests outside ComfyUI
+        pass
+
+
+def progress(steps):
+    try:
+        import comfy.utils
+        return comfy.utils.ProgressBar(steps)
+    except Exception:  # unit tests outside ComfyUI
+        return None
 
 
 def _resize_frames(x_nhwc, h, w, mode):

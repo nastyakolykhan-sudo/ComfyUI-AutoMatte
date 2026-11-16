@@ -20,7 +20,7 @@ import re
 import torch
 import torch.nn.functional as F
 
-from .nodes import _device, _resize_frames, CHUNK
+from .nodes import _device, _resize_frames, CHUNK, chunk_frames, make_room
 
 # ----------------------------------------------------------------------------------------------- colour names
 _CSS = (
@@ -516,9 +516,10 @@ class AutoMatteRecolour:
     def _samples(self, images, matte, dev):
         """sRGB samples of the subject core (matte > 0.5): (K,3), (K,) frame index, per-frame core pixel counts."""
         px_all, idx, counts = [], [], []
-        for i in range(0, images.shape[0], CHUNK):
-            rgb = images[i:i + CHUNK, ..., :3].to(dev).float()
-            m = matte[i:i + CHUNK].to(dev)
+        ck = chunk_frames(images.shape[1], images.shape[2])
+        for i in range(0, images.shape[0], ck):
+            rgb = images[i:i + ck, ..., :3].to(dev).float()
+            m = matte[i:i + ck].to(dev)
             for j in range(rgb.shape[0]):
                 core = m[j] > 0.5
                 k = int(core.sum().item())
@@ -810,11 +811,13 @@ class AutoMatteRecolour:
         r_guide, r_fg, r_area = max(2, round(0.004 * short)), max(3, round(0.01 * short)), max(3, round(0.006 * short))
         out = images.clone()
         after = [[] for _ in J_all]
-        for i in range(0, n, CHUNK):
-            m = matte[i:i + CHUNK].to(dev).float()
+        ck = chunk_frames(h, w)
+        make_room(dev, ck * h * w, floats_per_px=40 + 30 * len(J_all))   # every change keeps its own temporaries
+        for i in range(0, n, ck):
+            m = matte[i:i + ck].to(dev).float()
             if not bool((m > 0).any()):
                 continue
-            rgb = images[i:i + CHUNK, ..., :3].to(dev).float()
+            rgb = images[i:i + ck, ..., :3].to(dev).float()
             ok = srgb_to_ok(rgb)
             core = (m > 0.9).float()
             den = _box(_box(core, r_fg), r_fg)
@@ -833,7 +836,7 @@ class AutoMatteRecolour:
                     new = ok_to_srgb(self._recolour(ok, wsel, r, d, P))
                     new_fg = ok_to_srgb(self._recolour(ok_fg, w_fg, r_fg_amt, d, P))
                 else:
-                    fr = torch.arange(i, min(i + CHUNK, n))
+                    fr = torch.arange(i, min(i + ck, n))
                     fa_c, fb_c = J["sa"][fr].to(dev).view(-1, 1, 1), J["sb"][fr].to(dev).view(-1, 1, 1)
                     new = ok_to_srgb(self._correct(ok, d, fa_c, fb_c, P))
                     new_fg = ok_to_srgb(self._correct(ok_fg, d, fa_c, fb_c, P))
@@ -854,7 +857,7 @@ class AutoMatteRecolour:
                 change = change + k * (wsel * gj)[..., None] * (new - rgb) + (1 - k) * (w_fg * gfj)[..., None] * (new_fg - fg)
             res = (rgb + m[..., None] * change).clamp(0, 1)
             res = torch.where((m > 0)[..., None], res, rgb)  # exact outside the matte
-            out[i:i + CHUNK, ..., :3] = res.to(out.dtype).cpu()
+            out[i:i + ck, ..., :3] = res.to(out.dtype).cpu()
             for j, J in enumerate(J_all):
                 own = ws[j] * g[j]
                 sel = (m > 0.5) & (own >= 0.85)   # the core of what this change owns (not the blends at its borders)
