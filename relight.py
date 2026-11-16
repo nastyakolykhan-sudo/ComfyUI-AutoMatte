@@ -203,6 +203,7 @@ def make_plan(look, sun_direction, width, height, frames, fps, scene_text="", su
         plan.update(prompt=" ".join(parts), rotation=0.0, elevation=0.0, intensity=0.0, ball=None,
                     night_floor=dict(NIGHT_FLOOR[L["style"]]),
                     sun_direction="(not used at night)", lora="ltx-2.5-22b-ic-lora-day-to-night-0.9.safetensors",
+                    engine="ltx-2.5 day-to-night",
                     tile_frames=window_frames(n8, 97))
         strip = 0
         if (sun_direction or "").strip() and _key(sun_direction) != "auto":
@@ -228,19 +229,16 @@ def make_plan(look, sun_direction, width, height, frames, fps, scene_text="", su
         strip = _ceil(patch + 2 * margin, 32) if placement == "strip" else 0
         name = next((k for k, v in DIRECTIONS.items() if v == rot), "")
         plan.update(prompt=prompt, rotation=float(rot), elevation=float(L["elevation"]), intensity=intensity,
-                    sun_direction=f"{name.title()} ({how})", lora="ltx-2.3-22b-ic-lora-relight-1.0.safetensors",
+                    sun_direction=f"{name.title()} ({how})", lora=None, engine="passes",
                     tile_frames=window_frames(n8, 121),
                     ball={"patch": patch, "margin": margin, "placement": placement})
-        if scene["setting"] == "interior":
-            warnings.append("The shot looks like an interior: the sun relight model was trained on exteriors only, "
-                            "so the change may be weak (Night looks handle interiors)")
-        if height > width * 1.05:
-            notes.append("Portrait clip: the sun relight model was trained on landscape clips")
+        # sun looks are lit from the clip's own passes (AutoMatte Relight from Passes): no model limits apply; the
+        # prompt, ball and canvas fields stay for the Guide node, which only runs on the night route
     W, H = _ceil(cw, 32), _ceil(ch, 32)
     plan.update(content_w=cw, content_h=ch, canvas_w=W, canvas_h=H, strip_w=strip, gen_w=W + strip, gen_h=H)
-    if fps > 30.5:
-        notes.append(f"{fps:g} fps clip: both LoRAs were trained at 24 fps; conditioning fps capped at 30")
-    if frames > 361:
+    if L["night"] and fps > 30.5:
+        notes.append(f"{fps:g} fps clip: the Day-to-Night LoRA was trained at 24 fps; conditioning fps capped at 30")
+    if L["night"] and frames > 361:
         notes.append(f"Long clip ({frames} frames): run time grows with every extra window")
     # the subject to keep: a given matte, else the typed Subject, else the VLM's main subject
     typed = (subject_typed or "").strip()
