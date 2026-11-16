@@ -2,8 +2,11 @@
 
 - AutoMatteGivenOrMade  use a matte video when one is given, otherwise the matte the graph makes
                         (lazy: the segmentation branch only runs when no matte is given).
-- AutoMatteRecolour     recolour the subject to an exact colour (hex or name) inside the matte, or only
-                        correct a subject that drifts from it (brand colour lock), with a CIEDE2000 report.
+- AutoMatteRecolour     recolour the subject to an exact colour (hex, name, or a swatch image's colour) inside the
+                        matte, or only correct a subject that drifts from it (brand colour lock), with a CIEDE2000
+                        report; which colour changes is selectable (main / white / black / a colour / all), and
+                        several from → to changes run in one pass.
+- AutoMatteSubjectColour  'the white parts of the sneaker' -> follow 'sneaker', change 'white'.
 
 Colour maths in CIE Lab (D65, sRGB). Pixels outside the matte are returned unchanged, bit for bit.
 No model weights, only torch (and PyAV, which ComfyUI already ships, to read a matte video).
@@ -330,21 +333,103 @@ def _guided(guide, p, r, eps=1e-3):
 
 
 # ------------------------------------------------------------------------------------------------- Recolour
+_ARROW = re.compile(r"\s*(?:->|→|=>|➜|>|\bto\b)\s*", re.I)
+_NEUTRAL_WORDS = {"white": "white", "whites": "white", "offwhite": "white", "off-white": "white", "black": "black",
+                  "blacks": "black", "grey": "grey", "gray": "grey", "greys": "grey", "grays": "grey", "silver": "grey",
+                  "neutral": "any", "neutrals": "any"}
+_ALL_WORDS = {"all", "everything", "whole", "all of it", "the whole subject", "whole subject"}
+_AUTO_WORDS = {"", "auto", "main", "main colour", "main color"}
+_SWATCH_WORDS = {"", "reference", "swatch", "colour reference", "color reference", "reference image", "the reference"}
+_PART = r"(?:parts?|areas?|bits?|sections?|panels?|details?|accents?|regions?|pieces?|trims?|stripes?)"
+
+
+def _split_top(text):
+    """Split on commas, semicolons and new lines that are not inside parentheses (rgb(…) stays whole)."""
+    parts, depth, cur = [], 0, ""
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if ch in ",;\n" and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    parts.append(cur)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _selector_word(text):
+    """A 'which colour' word or None: auto / all / white|black|grey|any / a colour name or hex."""
+    t = re.sub(r"\s+", " ", (text or "").strip().lower())
+    t = re.sub(r"^(?:the|only the|just the|only|just)\s+", "", t)
+    if t in _AUTO_WORDS:
+        return "auto"
+    if t in _ALL_WORDS:
+        return "all"
+    if re.sub(r"[\s\-_]", "", t) in {k.replace("-", "") for k in _NEUTRAL_WORDS}:
+        return t
+    try:
+        parse_colour(t)
+        return t
+    except ValueError:
+        return None
+
+
+def split_subject_colour(subject):
+    """'the white parts of the sneaker' -> ('sneaker', 'white'); 'white of the shoe' -> ('shoe', 'white');
+    'white parts' -> ('', 'white'). Anything else -> (subject, '')."""
+    s = (subject or "").strip()
+    m = re.fullmatch(rf"(?:the\s+|only\s+the\s+|just\s+the\s+)?(?P<c>.+?)\s+{_PART}\s+(?:of|on|in)\s+(?:the\s+|a\s+|an\s+)?(?P<o>.+)", s, re.I) \
+        or re.fullmatch(r"(?:the\s+|only\s+the\s+|just\s+the\s+)?(?P<c>.+?)\s+of\s+(?:the\s+|a\s+|an\s+)?(?P<o>.+)", s, re.I) \
+        or re.fullmatch(rf"(?:the\s+|only\s+the\s+|just\s+the\s+)?(?P<c>.+?)\s+{_PART}", s, re.I)
+    if m:
+        c = _selector_word(m.group("c"))
+        if c and c not in ("auto", "all"):
+            return (m.groupdict().get("o") or "").strip(), c
+    return s, ""
+
+
+class AutoMatteSubjectColour:
+    """Split a Subject like 'the white parts of the sneaker' into what to follow ('sneaker') and which colour of it
+    changes ('white'). An explicit From Color wins over the one read from the Subject."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"subject": ("STRING", {"default": "", "forceInput": True}),
+                             "from_colour": ("STRING", {"default": "", "tooltip": "Explicit 'which colour changes'; wins over the Subject's colour words."})}}
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("subject", "from_colour")
+    FUNCTION = "run"
+    CATEGORY = "AutoMatte/Layers"
+
+    def run(self, subject, from_colour=""):
+        obj, c = split_subject_colour(subject)
+        return (obj, (from_colour or "").strip() or c)
+
+
 class AutoMatteRecolour:
     """Recolour the subject inside a matte to an exact colour.
 
-    Recolour: the subject's main colour becomes the target (its mean lightness, hue and chroma, calibrated so the
+    Which colour changes (`from_colour`): empty = the subject's main colour; `white` / `black` / `grey` = those
+      neutral parts (a white sole, black straps); a colour name or hex = that colour family wherever it is in the
+      subject (found near the given hue, so 'orange' matches the subject's own orange); `all` = the whole subject.
+    `colour` is the new colour (hex, rgb(), a name), or several changes at once as pairs: 'orange → #2B59C3,
+      white → black' (arrows ->, →, > or 'to'). Empty, or the word 'reference', = the main colour of `colour_image`
+      (a swatch or a packshot), measured.
+    Recolour: the selected colour becomes the target (its mean lightness, hue and chroma, calibrated so the
       measured result lands on the colour); the light and dark variation is kept (compressed only if it would clip),
-      so shading, reflections and print survive. On a coloured subject, parts that are already neutral (a white
-      sole, a white label, specular highlights, black print) stay, a colour gradient keeps its fade, and parts in a
-      clearly different hue (a gold cap on a blue bottle, a logo) are kept. A neutral or barely coloured subject
-      (white, grey, black, denim) takes the colour everywhere except clearly coloured details.
-    Correct: for a subject that should be this colour but drifts (e.g. generated footage): every frame's main
+      so shading, reflections and print survive. With the main colour selected: parts that are already neutral stay,
+      a colour gradient keeps its fade, and parts in a clearly different hue are kept. A neutral or barely coloured
+      subject takes the colour everywhere except clearly coloured details.
+    Correct: for a subject that should be this colour but drifts (e.g. generated footage): every frame's selected
       colour is turned onto the target hue and chroma; lightness is untouched (the scene's light stays).
     Edits run in OKLab; statistics over the whole clip (Recolour) or per frame smoothed over 5 frames (Correct), so
-    nothing flickers. Soft edges change only by the subject's own colour change (the background showing through an
-    edge stays as it was), and outside the matte the frames are returned bit for bit. The report measures the
-    subject's main colour before and after against the target in CIEDE2000."""
+    nothing flickers. Several changes blend where their colours meet (a fade from orange to white stays a fade).
+    Soft edges change only by the subject's own colour change, and outside the matte the frames are returned bit
+    for bit. The report measures every change before and after against its target in CIEDE2000."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -352,8 +437,12 @@ class AutoMatteRecolour:
             "required": {
                 "images": ("IMAGE",),
                 "matte": ("MASK", {"tooltip": "White = the subject to recolour (soft edges are blended)."}),
-                "colour": ("STRING", {"default": "#2E7D32", "tooltip": "Hex (#2E7D32), rgb(46, 125, 50) or a colour name (navy, forest green)."}),
+                "colour": ("STRING", {"default": "#2E7D32", "tooltip": "Hex (#2E7D32), rgb(46, 125, 50), a colour name, or pairs 'orange → navy, white → black'. Empty = the colour image's colour."}),
                 "mode": (["Recolour", "Correct"], {"default": "Recolour", "tooltip": "Recolour = change the subject to the colour; Correct = pull a subject that drifts back onto it."}),
+            },
+            "optional": {
+                "from_colour": ("STRING", {"default": "", "tooltip": "Which colour changes: empty = the main colour; white, black, grey, a colour name or hex; all = the whole subject."}),
+                "colour_image": ("IMAGE", {"lazy": True, "tooltip": "A swatch or packshot whose main colour is the target (used when colour is empty or says 'reference')."}),
             },
         }
 
@@ -363,6 +452,65 @@ class AutoMatteRecolour:
     CATEGORY = "AutoMatte/Layers"
 
     SAMPLES_PER_FRAME = 40000
+
+    # -- inputs -------------------------------------------------------------------------------------------
+    @staticmethod
+    def _needs_swatch(colour):
+        if not _ARROW.search(colour or ""):
+            return (colour or "").strip().lower() in _SWATCH_WORDS
+        return any(_ARROW.split(p, maxsplit=1)[-1].strip().lower() in _SWATCH_WORDS for p in _split_top(colour))
+
+    def check_lazy_status(self, colour="", **kw):
+        if "colour_image" in kw and kw["colour_image"] is None and self._needs_swatch(colour):
+            return ["colour_image"]
+        return []
+
+    @staticmethod
+    def _swatch_rgb(image):
+        """Main colour of a swatch / packshot image (centre 80 %): the largest colour cluster, else its median."""
+        im = image[0, ..., :3].float()
+        h, w = im.shape[0], im.shape[1]
+        im = im[int(0.1 * h):max(int(0.9 * h), int(0.1 * h) + 1), int(0.1 * w):max(int(0.9 * w), int(0.1 * w) + 1)]
+        step = max(1, int(max(im.shape[0], im.shape[1]) / 256))
+        px = im[::step, ::step].reshape(-1, 3)
+        ok = srgb_to_ok(px)
+        C = torch.hypot(ok[:, 1], ok[:, 2])
+        chromatic = C >= 6
+        if float(chromatic.float().mean()) >= 0.05 and int(chromatic.sum()) >= 50:
+            h0, _, near = AutoMatteRecolour._peak(ok[chromatic, 1], ok[chromatic, 2])
+            sel = px[chromatic][near] if int(near.sum()) >= 20 else px[chromatic]
+        else:
+            sel = px
+        lab = srgb_to_lab(sel.double()).median(0).values.tolist()
+        rgb = lab_to_srgb(torch.tensor(lab, dtype=torch.float64)).clamp(0, 1).tolist()
+        return tuple(int(round(v * 255)) for v in rgb)
+
+    def _jobs(self, colour, from_colour, colour_image):
+        """[(from_text, (rgb, hex), target_text)] from the colour / from_colour / swatch inputs."""
+        def target(t):
+            if t.strip().lower() in _SWATCH_WORDS:
+                if colour_image is None:
+                    raise ValueError("Give a Color (a hex code or a colour name), or a Color Reference image.")
+                rgb = self._swatch_rgb(colour_image)
+                return rgb, "#%02X%02X%02X" % rgb, "reference"
+            rgb, hx = parse_colour(t)
+            return rgb, hx, t.strip()
+
+        text = colour or ""
+        if not _ARROW.search(text):
+            rgb, hx, src = target(text)
+            return [((from_colour or "").strip(), rgb, hx, src)]
+        jobs = []
+        for p in _split_top(text):
+            bits = _ARROW.split(p, maxsplit=1)
+            if len(bits) != 2:
+                raise ValueError(f"'{p}': write each change as 'from → to', e.g. 'orange → #2B59C3, white → black'.")
+            frm, to = bits[0].strip(), bits[1].strip()
+            if _selector_word(frm) is None:
+                raise ValueError(f"'{frm}' isn't a colour to change: use white, black, grey, all, a colour name or a hex code.")
+            rgb, hx, src = target(to)
+            jobs.append((frm, rgb, hx, src))
+        return jobs
 
     # -- statistics ---------------------------------------------------------------------------------------
     def _samples(self, images, matte, dev):
@@ -387,6 +535,27 @@ class AutoMatteRecolour:
         return torch.cat(px_all), torch.cat(idx), counts
 
     @staticmethod
+    def _peak(a, b):
+        """Densest (a, b) cluster: hue h0, its 0.75-quantile chroma, and which samples are near the peak."""
+        ab = torch.stack([a, b], 1)
+        bins, lo, hi = 110, -130.0, 130.0
+        q = ((ab - lo) / (hi - lo) * bins).long().clamp(0, bins - 1)
+        hist = torch.zeros(bins * bins)
+        hist.index_add_(0, q[:, 0] * bins + q[:, 1], torch.ones(q.shape[0]))
+        hist = hist.view(1, 1, bins, bins)
+        for _ in range(2):
+            hist = F.avg_pool2d(hist, 3, stride=1, padding=1, count_include_pad=False)
+        p = int(hist.view(-1).argmax())
+        pa, pb = lo + (p // bins + 0.5) * (hi - lo) / bins, lo + (p % bins + 0.5) * (hi - lo) / bins
+        near = ((ab[:, 0] - pa) ** 2 + (ab[:, 1] - pb) ** 2) < 15 ** 2
+        da, db = (float(ab[near, 0].mean()), float(ab[near, 1].mean())) if int(near.sum()) > 20 else (pa, pb)
+        h0 = math.atan2(db, da)
+        C = torch.hypot(a, b)
+        same = _hue_diff(torch.atan2(b, a), h0).abs() < math.radians(25)
+        c_ref = _quantile(C[same], 0.75) if int(same.sum()) > 20 else math.hypot(da, db)
+        return h0, c_ref, near
+
+    @staticmethod
     def _dominant(ok):
         """Main colour from OKLab samples -> dict(kind, h, c_ref | c_lim, share)."""
         a, b = ok[:, 1], ok[:, 2]
@@ -395,21 +564,7 @@ class AutoMatteRecolour:
         share = float(chromatic.float().mean())
         info = {"share": share}
         if share >= 0.2 and int(chromatic.sum()) >= 200:
-            ab = torch.stack([a[chromatic], b[chromatic]], 1)
-            bins, lo, hi = 110, -130.0, 130.0
-            q = ((ab - lo) / (hi - lo) * bins).long().clamp(0, bins - 1)
-            hist = torch.zeros(bins * bins)
-            hist.index_add_(0, q[:, 0] * bins + q[:, 1], torch.ones(q.shape[0]))
-            hist = hist.view(1, 1, bins, bins)
-            for _ in range(2):
-                hist = F.avg_pool2d(hist, 3, stride=1, padding=1, count_include_pad=False)
-            p = int(hist.view(-1).argmax())
-            pa, pb = lo + (p // bins + 0.5) * (hi - lo) / bins, lo + (p % bins + 0.5) * (hi - lo) / bins
-            near = ((ab[:, 0] - pa) ** 2 + (ab[:, 1] - pb) ** 2) < 15 ** 2
-            da, db = (float(ab[near, 0].mean()), float(ab[near, 1].mean())) if int(near.sum()) > 20 else (pa, pb)
-            h0 = math.atan2(db, da)
-            same = _hue_diff(torch.atan2(ab[:, 1], ab[:, 0]), h0).abs() < math.radians(25)
-            c_ref = _quantile(C[chromatic][same], 0.75) if int(same.sum()) > 20 else math.hypot(da, db)
+            h0, c_ref, _ = AutoMatteRecolour._peak(a[chromatic], b[chromatic])
             if c_ref >= 18:
                 info.update(kind="chromatic", h=h0, c_ref=c_ref)
                 return info
@@ -419,12 +574,103 @@ class AutoMatteRecolour:
         return info
 
     @staticmethod
+    def _otsu(L):
+        """Light/dark split of neutral lightness: threshold, or None when one tone dominates."""
+        if L.numel() < 200:
+            return None
+        hist = torch.histc(L.float(), bins=50, min=0, max=100)
+        p = hist / hist.sum()
+        centers = torch.linspace(1, 99, 50)
+        best, t_best = -1.0, None
+        for k in range(5, 45):
+            w0, w1 = float(p[:k].sum()), float(p[k:].sum())
+            if w0 < 0.1 or w1 < 0.1:
+                continue
+            m0 = float((p[:k] * centers[:k]).sum()) / w0
+            m1 = float((p[k:] * centers[k:]).sum()) / w1
+            var = w0 * w1 * (m1 - m0) ** 2
+            if var > best:
+                best, t_best, gap = var, float(centers[k] - 1), m1 - m0
+        return t_best if t_best is not None and gap > 30 else None
+
+    def _select(self, ok_s, sel, mode="Recolour"):
+        """Selection info for one 'which colour' text, from the subject's samples -> dict, or (None, reason)."""
+        word = _selector_word(sel)
+        if word is None:
+            return None, f"'{sel}' isn't a colour to change"
+        if word == "auto":
+            d = self._dominant(ok_s)
+            d["sel"] = "main"
+            return d, None
+        if word == "all":
+            return {"kind": "all", "sel": "all", "share": 1.0}, None
+        C = torch.hypot(ok_s[:, 1], ok_s[:, 2])
+        neutral_word = _NEUTRAL_WORDS.get(re.sub(r"[\s_]", "", word))
+        if neutral_word is None:
+            rgb, _ = parse_colour(word)
+            okc = srgb_to_ok(torch.tensor([v / 255.0 for v in rgb], dtype=torch.float32)).tolist()
+            cc = math.hypot(okc[1], okc[2])
+            if cc < 6:
+                neutral_word = "white" if okc[0] > 70 else ("black" if okc[0] < 30 else "grey")
+            else:
+                hq = math.atan2(okc[2], okc[1])
+                chrom = C >= 6
+                close = chrom & (_hue_diff(torch.atan2(ok_s[:, 2], ok_s[:, 1]), hq).abs() < math.radians(40))
+                if int(close.sum()) < max(200, int(0.01 * ok_s.shape[0])):
+                    return None, f"No {sel} found in the subject"
+                h0, c_ref, _ = self._peak(ok_s[close, 1], ok_s[close, 2])
+                return {"kind": "chromatic", "sel": sel, "h": h0, "c_ref": max(c_ref, 8.0),
+                        "share": float(close.float().mean())}, None
+        # neutral parts: low chroma, split into light and dark tones when both are there. On a coloured subject a
+        # fade from its colour into white is part white all the way: the neutral share falls off with chroma
+        # relative to the subject's own colour, so the fade turns into a fade to the new colour (no pale band)
+        c1, c2 = 4.0, 16.0
+        chrom = C >= 6
+        if mode == "Recolour" and float(chrom.float().mean()) >= 0.1 and int(chrom.sum()) >= 200:
+            _, c_main, _ = self._peak(ok_s[chrom, 1], ok_s[chrom, 2])
+            if c_main >= 18:
+                c2 = max(16.0, 0.9 * c_main)
+        Ln = ok_s[C < 10, 0]
+        if Ln.numel() < max(200, int(0.01 * ok_s.shape[0])):
+            return None, f"No {sel} parts found in the subject"
+        t = self._otsu(Ln)
+        mean_l = float(Ln.mean())
+        if neutral_word == "any" or t is None:
+            if neutral_word == "white" and t is None and mean_l < 45:
+                return None, f"No {sel} parts found in the subject (its neutral parts are dark)"
+            if neutral_word == "black" and t is None and mean_l > 55:
+                return None, f"No {sel} parts found in the subject (its neutral parts are light)"
+            side = "any"
+        elif neutral_word == "white":
+            side = "light"
+        elif neutral_word == "black":
+            side = "dark"
+        else:   # grey: the tone nearer the middle
+            m_dark, m_light = float(Ln[Ln < t].mean()), float(Ln[Ln >= t].mean())
+            side = "dark" if abs(m_dark - 50) < abs(m_light - 50) else "light"
+        d = {"kind": "neutral_sel", "sel": sel, "c1": c1, "c2": c2, "t": t, "side": side}
+        w, _ = self._weights(ok_s, d)
+        d["share"] = float((w >= 0.5).float().mean())
+        if d["share"] < 0.01:
+            return None, f"No {sel} parts found in the subject"
+        return d, None
+
+    @staticmethod
     def _weights(ok, d):
-        """Selection weight w (pixel belongs to the main colour) and colour amount r."""
+        """Selection weight w (pixel belongs to the selected colour) and colour amount r."""
         C = torch.hypot(ok[..., 1], ok[..., 2])
         if d["kind"] == "chromatic":
             dh = _hue_diff(torch.atan2(ok[..., 2], ok[..., 1]), d["h"]).abs()
             return 1 - _smoothstep(dh, math.radians(30), math.radians(55)), (C / d["c_ref"]).clamp(0, 1.25)
+        if d["kind"] == "all":
+            return torch.ones_like(C), torch.ones_like(C)
+        if d["kind"] == "neutral_sel":
+            w = 1 - _smoothstep(C, d["c1"], d["c2"])
+            if d["side"] == "light":
+                w = w * _smoothstep(ok[..., 0], d["t"] - 5, d["t"] + 5)
+            elif d["side"] == "dark":
+                w = w * (1 - _smoothstep(ok[..., 0], d["t"] - 5, d["t"] + 5))
+            return w, torch.ones_like(C)
         return 1 - _smoothstep(C, 0.6 * d["c_lim"], d["c_lim"]), torch.ones_like(C)
 
     @staticmethod
@@ -447,7 +693,7 @@ class AutoMatteRecolour:
 
     @staticmethod
     def _correct(ok, d, fa, fb, P):
-        """fa, fb: per-frame main colour (broadcastable to ok[..., 0])."""
+        """fa, fb: per-frame selected colour (broadcastable to ok[..., 0])."""
         L, a, b = ok[..., 0], ok[..., 1], ok[..., 2]
         if d["kind"] == "chromatic":
             fh, fc = torch.atan2(fb, fa), torch.hypot(fa, fb).clamp_min(1.0)
@@ -456,71 +702,58 @@ class AutoMatteRecolour:
             return torch.stack([L, c_new * torch.cos(h_new), c_new * torch.sin(h_new)], -1)
         return torch.stack([L, a + (P["ta"] - fa), b + (P["tb"] - fb)], -1)
 
-    # -- the edit ------------------------------------------------------------------------------------------
-    def run(self, images, matte, colour, mode="Recolour"):
-        rgb_t, hex_t = parse_colour(colour)
+    # -- one change: statistics, shading range, calibration ------------------------------------------------
+    def _prepare(self, job, ok_s, rgb_s, idx_s, n, mode):
+        frm, rgb_t, hex_t, src = job
         lab_t = rgb255_to_lab(rgb_t)
         ok_t = srgb_to_ok(torch.tensor([v / 255.0 for v in rgb_t], dtype=torch.float64)).tolist()
-        mode = "Correct" if str(mode).strip().lower() in ("correct", "lock", "colour lock", "color lock") else "Recolour"
-        n, h, w = images.shape[0], images.shape[1], images.shape[2]
-        matte = _fit_mask(matte, n, h, w)
-        dev = _device()
-        report = {"edit": "recolour", "mode": mode, "colour_input": colour, "colour": hex_t,
-                  "colour_lab": [round(v, 2) for v in lab_t], "notes": [], "review_reasons": []}
+        rep = {"from": frm or "main colour", "colour_input": src, "colour": hex_t,
+               "colour_lab": [round(v, 2) for v in lab_t]}
+        d, why = self._select(ok_s, frm, mode)
+        if d is None:
+            return None, rep, why
         P = {"tl": ok_t[0], "ta": ok_t[1], "tb": ok_t[2], "tc": math.hypot(ok_t[1], ok_t[2]),
              "th": math.atan2(ok_t[2], ok_t[1]), "l_off": 0.0, "gain": 1.0, "h_off": 0.0, "s": 1.0, "mean_l": 50.0}
-
-        rgb_s, idx_s, counts = self._samples(images, matte, dev)
-        report["frames_without_subject"] = int(sum(1 for k in counts if k == 0))
-        if rgb_s is None or rgb_s.shape[0] < 50:
-            report["review_reasons"].append("No subject in the matte: nothing was recoloured")
-            report["needs_review"] = True
-            return (images, json.dumps(report))
-        ok_s = srgb_to_ok(rgb_s.float())
-        d = self._dominant(ok_s)
         w_s, r_s = self._weights(ok_s, d)
         main = (w_s >= 0.5) & ((r_s >= 0.6) if d["kind"] == "chromatic" else torch.ones_like(w_s, dtype=torch.bool))
         if int(main.sum()) < 50:
+            if d["sel"] != "main":
+                return None, rep, f"No {frm} found in the subject"
             main = torch.ones_like(w_s, dtype=torch.bool)
         lab_main = srgb_to_lab(rgb_s[main].double())
         before = lab_main.mean(0).tolist()
-        c_s = torch.hypot(ok_s[:, 1], ok_s[:, 2])
-        kept_share = float(((w_s < 0.5) & (c_s >= 6)).float().mean())   # parts in another colour, kept
-        neutral_kept = float(((c_s < 6) & ~main).float().mean()) if d["kind"] == "chromatic" else 0.0
-        report.update(subject_colour_kind=d["kind"], subject_chromatic_share=round(d["share"], 3),
-                      subject_colour_before=lab_to_hex(before),
-                      delta_e00_before=round(ciede2000(before, lab_t), 2), kept_share=round(kept_share, 3),
-                      neutral_kept_share=round(neutral_kept, 3))
-
+        rep.update(kind=d["kind"], share_of_subject=round(float(main.float().mean()), 3),
+                   subject_colour_before=lab_to_hex(before), delta_e00_before=round(ciede2000(before, lab_t), 2))
         L_main = ok_s[main, 0]
         P["mean_l"] = float(L_main.mean())
+        J = {"d": d, "P": P, "lab_t": lab_t, "rep": rep, "w_s": w_s, "main": main}
         if mode == "Recolour":
             p2, p98 = _quantile(L_main, 0.02), _quantile(L_main, 0.98)
             s = min((97 - P["tl"]) / max(p98 - P["mean_l"], 1.0), (P["tl"] - 3) / max(P["mean_l"] - p2, 1.0), 1.0)
             P["s"] = max(s, 0.35)
-            report["shading_kept"] = round(P["s"], 3)
-            if P["s"] < 0.6:
-                report["notes"].append("The subject's light and dark range was compressed to fit the colour")
-            # calibrate on the samples so the measured main colour lands on the target (gamut clipping included)
+            rep["shading_kept"] = round(P["s"], 3)
             sub = ok_s[main]
             if sub.shape[0] > 200000:
                 sub = sub[torch.linspace(0, sub.shape[0] - 1, 200000).long()]
             ws, rs = self._weights(sub, d)
-            for _ in range(4):
-                back = srgb_to_ok(ok_to_srgb(self._recolour(sub, ws, rs, d, P)))
-                mL, ma, mb = back[:, 0].mean().item(), back[:, 1].mean().item(), back[:, 2].mean().item()
-                P["l_off"] = max(-20.0, min(20.0, P["l_off"] + P["tl"] - mL))
+            for _ in range(5):
+                srgb_back = ok_to_srgb(self._recolour(sub, ws, rs, d, P))
+                back = srgb_to_ok(srgb_back)
+                ma, mb = back[:, 1].mean().item(), back[:, 2].mean().item()
+                # lightness aimed at what the report measures (the mean in CIE Lab), not the OKLab mean: they part
+                # for a wide light-dark spread near black or white
+                mL_cie = srgb_to_lab(srgb_back.double()).mean(0)[0].item()
+                P["l_off"] = max(-25.0, min(25.0, P["l_off"] + 0.86 * (lab_t[0] - mL_cie)))
                 if P["tc"] > 2:
                     P["gain"] = max(0.5, min(1.8, P["gain"] * max(0.7, min(1.4, P["tc"] / max(math.hypot(ma, mb), 1e-3)))))
                     P["h_off"] += float(_hue_diff(torch.tensor(P["th"]), torch.tensor(math.atan2(mb, ma))))
         else:
-            fa, fb, fl = (torch.full((n,), float("nan")) for _ in range(3))
-            fi = idx_s[main]
-            okm = ok_s[main]
+            fa, fb = (torch.full((n,), float("nan")) for _ in range(2))
+            fi, okm = idx_s[main], ok_s[main]
             for f in torch.unique(fi).tolist():
                 sel = fi == f
                 if int(sel.sum()) >= 20:
-                    fl[f], fa[f], fb[f] = okm[sel, 0].mean(), okm[sel, 1].mean(), okm[sel, 2].mean()
+                    fa[f], fb[f] = okm[sel, 1].mean(), okm[sel, 2].mean()
             valid = ~torch.isnan(fa)
             k5 = torch.ones(1, 1, 5)
 
@@ -529,8 +762,8 @@ class AutoMatteRecolour:
                 den = F.conv1d(valid.float().view(1, 1, -1), k5, padding=2).view(-1)
                 return torch.where(den > 0, num / den.clamp_min(1e-6), torch.full_like(x, float("nan")))
             sa, sb = smooth(fa), smooth(fb)
-            sa = torch.where(torch.isnan(sa), torch.full_like(sa, P["ta"]), sa)
-            sb = torch.where(torch.isnan(sb), torch.full_like(sb, P["tb"]), sb)
+            J["sa"] = torch.where(torch.isnan(sa), torch.full_like(sa, P["ta"]), sa)
+            J["sb"] = torch.where(torch.isnan(sb), torch.full_like(sb, P["tb"]), sb)
             de_f = []
             for f in torch.unique(fi).tolist():
                 sel = fi == f
@@ -538,69 +771,146 @@ class AutoMatteRecolour:
                     lab_f = srgb_to_lab(rgb_s[main][sel].double()).mean(0).tolist()
                     de_f.append(ciede2000(lab_f, [lab_f[0], lab_t[1], lab_t[2]]))
             if de_f:
-                report["delta_e00_hue_chroma_before"] = {"mean": round(sum(de_f) / len(de_f), 2), "max": round(max(de_f), 2)}
-            if report["delta_e00_before"] > 25:
-                report["review_reasons"].append("The subject is far from this colour: Correct only fixes drift; "
-                                                "use Recolour to change the colour")
+                rep["delta_e00_hue_chroma_before"] = {"mean": round(sum(de_f) / len(de_f), 2), "max": round(max(de_f), 2)}
+        return J, rep, None
+
+    # -- the edit ------------------------------------------------------------------------------------------
+    def run(self, images, matte, colour, mode="Recolour", from_colour="", colour_image=None):
+        mode = "Correct" if str(mode).strip().lower() in ("correct", "lock", "colour lock", "color lock") else "Recolour"
+        jobs = self._jobs(colour, from_colour, colour_image)
+        n, h, w = images.shape[0], images.shape[1], images.shape[2]
+        matte = _fit_mask(matte, n, h, w)
+        dev = _device()
+        report = {"edit": "recolour", "mode": mode, "colour_input": colour, "notes": [], "review_reasons": []}
+        if from_colour:
+            report["from_colour_input"] = from_colour
+
+        rgb_s, idx_s, counts = self._samples(images, matte, dev)
+        report["frames_without_subject"] = int(sum(1 for k in counts if k == 0))
+        if rgb_s is None or rgb_s.shape[0] < 50:
+            report.update(colour=jobs[0][2], needs_review=True)
+            report["review_reasons"].append("No subject in the matte: nothing was recoloured")
+            return (images, json.dumps(report))
+        ok_s = srgb_to_ok(rgb_s.float())
+
+        J_all, reps = [], []
+        for job in jobs:
+            J, rep, why = self._prepare(job, ok_s, rgb_s, idx_s, n, mode)
+            reps.append(rep)
+            if J is None:
+                report["review_reasons"].append(f"{why}: '{rep['from']} → {rep['colour']}' changed nothing")
+                continue
+            J_all.append(J)
+        if not J_all:
+            report.update(colour=jobs[0][2], changes=reps, needs_review=True)
+            return (images, json.dumps(report))
 
         # -- apply in chunks -------------------------------------------------------------------------------
         short = min(h, w)
-        r_guide, r_fg = max(2, round(0.004 * short)), max(3, round(0.01 * short))
+        r_guide, r_fg, r_area = max(2, round(0.004 * short)), max(3, round(0.01 * short)), max(3, round(0.006 * short))
         out = images.clone()
-        after = []
+        after = [[] for _ in J_all]
         for i in range(0, n, CHUNK):
             m = matte[i:i + CHUNK].to(dev).float()
             if not bool((m > 0).any()):
                 continue
             rgb = images[i:i + CHUNK, ..., :3].to(dev).float()
             ok = srgb_to_ok(rgb)
-            wsel, r = self._weights(ok, d)
-            wsel = _guided(ok[..., 0] / 100.0, wsel, r_guide)
-            # the subject's own colour near each edge pixel (interior colours spread outwards)
             core = (m > 0.9).float()
             den = _box(_box(core, r_fg), r_fg)
             fg = _box(_box(rgb * core[..., None], r_fg), r_fg) / den.clamp_min(1e-4)[..., None]
             fg = torch.where((den > 0.02)[..., None], fg, rgb)
             ok_fg = srgb_to_ok(fg)
-            w_fg, r_fg_amt = self._weights(ok_fg, d)
-            if mode == "Recolour":
-                new = ok_to_srgb(self._recolour(ok, wsel, r, d, P))
-                new_fg = ok_to_srgb(self._recolour(ok_fg, w_fg, r_fg_amt, d, P))
-            else:
-                fr = torch.arange(i, min(i + CHUNK, n))
-                fa_c, fb_c = sa[fr].to(dev).view(-1, 1, 1), sb[fr].to(dev).view(-1, 1, 1)
-                new = ok_to_srgb(self._correct(ok, d, fa_c, fb_c, P))
-                new_fg = ok_to_srgb(self._correct(ok_fg, d, fa_c, fb_c, P))
+            ws, news, wfs, newfs, rs, eff, eff_fg = [], [], [], [], [], [], []
+            for J in J_all:
+                d, P = J["d"], J["P"]
+                wsel, r = self._weights(ok, d)
+                if d["kind"] == "neutral_sel":   # small specks (a highlight on a coloured part) are not a white part
+                    wsel = wsel * _smoothstep(_box(wsel, r_area), 0.2, 0.45)
+                wsel = _guided(ok[..., 0] / 100.0, wsel, r_guide)
+                w_fg, r_fg_amt = self._weights(ok_fg, d)
+                if mode == "Recolour":
+                    new = ok_to_srgb(self._recolour(ok, wsel, r, d, P))
+                    new_fg = ok_to_srgb(self._recolour(ok_fg, w_fg, r_fg_amt, d, P))
+                else:
+                    fr = torch.arange(i, min(i + CHUNK, n))
+                    fa_c, fb_c = J["sa"][fr].to(dev).view(-1, 1, 1), J["sb"][fr].to(dev).view(-1, 1, 1)
+                    new = ok_to_srgb(self._correct(ok, d, fa_c, fb_c, P))
+                    new_fg = ok_to_srgb(self._correct(ok_fg, d, fa_c, fb_c, P))
+                ws.append(wsel.clamp(0, 1)); news.append(new); wfs.append(w_fg.clamp(0, 1)); newfs.append(new_fg); rs.append(r)
+                # how much this change really claims a pixel: a hue selection barely touches grey pixels (its
+                # change scales with their chroma), so it must not dilute a white/black change there
+                eff.append(wsel.clamp(0, 1) * (r.clamp(0, 1) if d["kind"] == "chromatic" else 1.0))
+                eff_fg.append(w_fg.clamp(0, 1) * (r_fg_amt.clamp(0, 1) if d["kind"] == "chromatic" else 1.0))
+            # each change keeps its own strength (w) and shares a pixel with the others in proportion to its claim;
+            # one change alone always gets share 1, so a single change is exactly the one-colour edit
+            def shares(cl):
+                tot = torch.stack(cl).sum(0)
+                return [torch.where(tot > 1e-4, c / tot.clamp_min(1e-4), torch.full_like(c, 1.0 / len(cl))) for c in cl]
+            g, g_fg = shares(eff), shares(eff_fg)
             k = torch.where(den > 0.02, _smoothstep(m, 0.5, 0.95), torch.ones_like(m))[..., None]
-            change = k * wsel[..., None] * (new - rgb) + (1 - k) * w_fg[..., None] * (new_fg - fg)
+            change = torch.zeros_like(rgb)
+            for wsel, new, w_fg, new_fg, gj, gfj in zip(ws, news, wfs, newfs, g, g_fg):
+                change = change + k * (wsel * gj)[..., None] * (new - rgb) + (1 - k) * (w_fg * gfj)[..., None] * (new_fg - fg)
             res = (rgb + m[..., None] * change).clamp(0, 1)
             res = torch.where((m > 0)[..., None], res, rgb)  # exact outside the matte
             out[i:i + CHUNK, ..., :3] = res.to(out.dtype).cpu()
-            sel = (m > 0.5) & (wsel >= 0.5)
-            if d["kind"] == "chromatic":
-                sel = sel & (r >= 0.6)
-            if bool(sel.any()):
-                px = res[sel]
-                if px.shape[0] > 20000:
-                    px = px[torch.linspace(0, px.shape[0] - 1, 20000, device=dev).long()]
-                after.append(px.cpu())
+            for j, J in enumerate(J_all):
+                own = ws[j] * g[j]
+                sel = (m > 0.5) & (own >= 0.85)   # the core of what this change owns (not the blends at its borders)
+                if int(sel.sum()) < 200:
+                    sel = (m > 0.5) & (own >= 0.5)
+                if J["d"]["kind"] == "chromatic":
+                    sel = sel & (rs[j] >= 0.6)
+                if bool(sel.any()):
+                    px = res[sel]
+                    if px.shape[0] > 20000:
+                        px = px[torch.linspace(0, px.shape[0] - 1, 20000, device=dev).long()]
+                    after[j].append(px.cpu())
 
-        if after:
-            lab_after = srgb_to_lab(torch.cat(after).double()).mean(0).tolist()
-            report["subject_colour_after"] = lab_to_hex(lab_after)
+        des = []
+        for J, px in zip(J_all, after):
+            rep, lab_t = J["rep"], J["lab_t"]
+            if not px:
+                continue
+            lab_after = srgb_to_lab(torch.cat(px).double()).mean(0).tolist()
+            rep["subject_colour_after"] = lab_to_hex(lab_after)
             if mode == "Recolour":
                 de = ciede2000(lab_after, lab_t)
-                report["delta_e00_after"] = round(de, 2)
+                rep["delta_e00_after"] = round(de, 2)
+                des.append(de)
                 if de > 3:
-                    report["review_reasons"].append(f"The recoloured subject is {de:.1f} dE00 from the colour "
-                                                    "(a very light, dark or saturated colour can't be reached on this subject)")
+                    report["review_reasons"].append(
+                        f"'{rep['from']} → {rep['colour']}' landed {de:.1f} dE00 from the colour (a very light, dark or "
+                        "saturated colour can't be reached on this subject)")
             else:
-                report["delta_e00_hue_chroma_after"] = round(ciede2000(lab_after, [lab_after[0], lab_t[1], lab_t[2]]), 2)
-        if kept_share > 0.1:
-            report["notes"].append(f"{kept_share:.0%} of the subject is in another colour and was kept (a logo, a cap, "
-                                   "skin); name the part to recolour (e.g. 'bottle body') to be sure")
-        if neutral_kept > 0.1:
-            report["notes"].append(f"White, grey and black parts ({neutral_kept:.0%} of the subject) kept their colour")
+                rep["delta_e00_hue_chroma_after"] = round(ciede2000(lab_after, [lab_after[0], lab_t[1], lab_t[2]]), 2)
+            if J["d"].get("sel") not in ("main", "all"):
+                report["notes"].append(f"Only the {rep['from']} parts changed ({rep['share_of_subject']:.0%} of the subject)")
+
+        # top level: the first change's fields (one change = the whole story), the list when there are several
+        first = J_all[0]
+        report.update({k: v for k, v in first["rep"].items() if k not in ("from",)})
+        report["from_colour"] = first["rep"]["from"]
+        if any(j[3] == "reference" for j in jobs):
+            report["notes"].append("The new colour was measured on the Color Reference image: "
+                                   + ", ".join(r["colour"] for r, j in zip(reps, jobs) if j[3] == "reference"))
+        if len(jobs) > 1:
+            report["changes"] = reps
+            if des:
+                report["delta_e00_after"] = round(max(des), 2)
+        d0 = first["d"]
+        if len(jobs) == 1 and d0.get("sel") == "main":
+            w_s, main = first["w_s"], first["main"]
+            c_s = torch.hypot(ok_s[:, 1], ok_s[:, 2])
+            kept_share = float(((w_s < 0.5) & (c_s >= 6)).float().mean())   # parts in another colour, kept
+            neutral_kept = float(((c_s < 6) & ~main).float().mean()) if d0["kind"] == "chromatic" else 0.0
+            report.update(kept_share=round(kept_share, 3), neutral_kept_share=round(neutral_kept, 3))
+            if kept_share > 0.1:
+                report["notes"].append(f"{kept_share:.0%} of the subject is in another colour and was kept (a logo, a cap, "
+                                       "skin); name the part to recolour (e.g. 'bottle body') to be sure")
+            if neutral_kept > 0.1:
+                report["notes"].append(f"White, grey and black parts ({neutral_kept:.0%} of the subject) kept their colour")
         if report["frames_without_subject"]:
             report["notes"].append(f"{report['frames_without_subject']} frames have no subject and are unchanged")
         report["needs_review"] = bool(report["review_reasons"])
@@ -683,10 +993,12 @@ class AutoMatteProtect:
 NODE_CLASS_MAPPINGS = {
     "AutoMatteGivenOrMade": AutoMatteGivenOrMade,
     "AutoMatteRecolour": AutoMatteRecolour,
+    "AutoMatteSubjectColour": AutoMatteSubjectColour,
     "AutoMatteProtect": AutoMatteProtect,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AutoMatteGivenOrMade": "AutoMatte: Given or Made Matte",
     "AutoMatteRecolour": "AutoMatte: Recolour",
+    "AutoMatteSubjectColour": "AutoMatte: Subject Colour Words",
     "AutoMatteProtect": "AutoMatte: Protect People",
 }
