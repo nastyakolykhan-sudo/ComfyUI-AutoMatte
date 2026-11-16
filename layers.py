@@ -622,8 +622,9 @@ def names_people(text):
 class AutoMatteProtect:
     """Take parts that must not change out of a matte, e.g. people's faces, necks, hands and hair when a garment or a
     held product is edited (a soft matte of a coat reaches into the neck and the hand). `protect` is lazy: whatever
-    makes it (e.g. SAM on "face, neck, hand, hair") only runs when the subject text doesn't itself name people or a
-    body part (then nothing is protected: "hair", "lips", "woman" are the subject). The protect mask is grown a
+    makes it (e.g. SAM on "face, neck, hand, hair") only runs when `enabled` is on (wire a "is a person in the clip?"
+    check to it: on a product shot a detector can mistake laces or a heel for hair or a hand) and the subject text
+    doesn't itself name people or a body part (then nothing is protected: "hair", "lips", "woman" are the subject). The protect mask is grown a
     little and feathered, then removed: matte * (1 - protect). `report` (JSON, optional) gets the protected share."""
 
     @classmethod
@@ -636,6 +637,7 @@ class AutoMatteProtect:
             "optional": {
                 "subject_text": ("STRING", {"forceInput": True, "tooltip": "What is edited; naming people or a body part turns protection off."}),
                 "report": ("STRING", {"forceInput": True}),
+                "enabled": ("BOOLEAN", {"default": True, "tooltip": "Off = nothing is protected and `protect` is never computed (e.g. no person in the clip)."}),
             },
         }
 
@@ -644,19 +646,21 @@ class AutoMatteProtect:
     FUNCTION = "run"
     CATEGORY = "AutoMatte/Layers"
 
-    def check_lazy_status(self, matte, protect=None, subject_text=None, report=None):
-        if names_people(subject_text):
+    def check_lazy_status(self, matte, protect=None, subject_text=None, report=None, enabled=True):
+        if not enabled or names_people(subject_text):
             return []
         return ["protect"] if protect is None else []
 
-    def run(self, matte, protect=None, subject_text=None, report=None):
+    def run(self, matte, protect=None, subject_text=None, report=None, enabled=True):
         try:
             rep = json.loads(report) if report else {}
         except Exception:
             rep = {"report": report}
         n, h, w = matte.shape
-        if names_people(subject_text) or protect is None:
+        if not enabled or names_people(subject_text) or protect is None:
             rep["people_protected"] = False
+            if not enabled:
+                rep["people_in_clip"] = False
             return (matte, json.dumps(rep))
         p = _fit_mask(protect, n, h, w)
         short = min(h, w)
