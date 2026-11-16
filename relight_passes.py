@@ -7,8 +7,10 @@ SwitchLight-style relight), so the light direction is exact instead of guessed b
 How it works, per frame, at a processing size (the light is smooth, so it's computed small and scaled up):
 1. New light: a sun from the plan's direction (rotation 0 = from the camera side, 90 = from the right, 180 = from
    behind; elevation above the horizon) with the Look's colour and strength, a sky/ground hemisphere fill, Lambert
-   shading on the normals (softened for soft looks) and cast shadows marched through the depth pass toward the sun
-   (screen-space heightfield shadows: only things nearer the camera can shadow; the penumbra follows the look).
+   shading on the normals (softened for soft looks) and cast shadows: rays marched toward the sun in perspective (to
+   the sun's vanishing point, or away from the antisolar point) with their distance tracked against the depth pass,
+   whose log scale is recovered from the normal pass; things block a ray only within a thickness, so shadows start at
+   contact points and fall along the ground; the penumbra follows the look.
 2. Light as shot: source / base colour, smoothed along the depth pass's edges (so it follows geometry, not texture,
    and doesn't bleed across a silhouette), with the clip's own light colour taken out, so the old tint doesn't stay.
 3. Output = source pixels x (new light / light as shot): every texture, face and print stays the source's; only the
@@ -57,6 +59,12 @@ LIGHT_LOOKS = {
 DEFAULT_LOOK = "golden hour"
 STEADY_SIGMA = 0.08  # source log-luminance change that counts as "the picture changed here" (grain is ~0.02)
 SKY_DEPTH = 0.02     # the far end of the depth pass (clip-normalised, near = 1) that can be sky
+HFOV_DEG = 50.0      # assumed horizontal field of view (perspective of the shadow rays)
+DEFAULT_LOG_RANGE = 2.5  # log(far / near) of the depth pass when the normals can't tell (about 12x)
+SHADOW_BIAS = 0.03   # log distance: a surface must stand this much in front of the shadow ray to block it ...
+SHADOW_THICKNESS = 0.10  # ... and no more than this (~10% nearer): things have a thickness; one far in front doesn't
+SHADOW_REACH = 0.5   # how far the shadow rays go, as a share of the width (long low-sun shadows)
+SHADOW_STEPS = 96
 
 
 SIDE_PULL = 20.0   # a pure side sun (rotation +-90) is pulled this far toward the camera, as a 3/4 key
@@ -79,34 +87,88 @@ def light_vector(rotation, elevation):
     return (math.cos(el) * math.sin(az), math.sin(el), math.cos(el) * math.cos(az))
 
 
-def cast_shadow(height, L, hardness, steps=48, reach=0.22):
-    """Screen-space heightfield shadows. height: (N,H,W) in pixels toward the camera (near = high). L: unit vector
-    toward the light. March toward the light in image space; only samples nearer the camera than the receiver can
-    occlude (so a receding floor or a flat wall never shadows itself), and they must stand above the ray, which climbs
-    by L_z per pixel of L_xy when the light is on the camera side (flat for side and back light). Occluders fade out
-    toward the end of the reach (no hard cut), and the map is blurred by a penumbra that widens as the look gets
-    softer (hardness: high = crisp). Returns (N,H,W) in [0, 1], 1 = lit."""
-    n, h, w = height.shape
+def focal_px(w):
+    """Focal length in pixels for an image w pixels wide, at the assumed field of view."""
+    return (w / 2) / math.tan(math.radians(HFOV_DEG / 2))
+
+
+def depth_log_range(normal, depth, f):
+    """R such that log(distance) = -R x depth pass + const: the depth pass is clip-normalised log depth, so its scale
+    is lost; the normal pass gives it back. On a surface with normal N, log depth changes across the image as
+    dlogD/du = -Nx / (f N.r) and dlogD/dv = Ny / (f N.r) (r = the pixel's ray (xn, -yn, -1)), and the depth pass
+    changes as -1/R times that. Median over pixels on oblique surfaces with a usable depth slope (no silhouettes).
+    normal (N,H,W,3) in (n+1)/2, depth (N,H,W). Returns (R, pixels used)."""
+    n, h, w = depth.shape
+    N = normal * 2 - 1
+    N = N / N.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    d = _gauss(depth, 1.0)
+    gu = torch.zeros_like(d)
+    gv = torch.zeros_like(d)
+    gu[:, :, 1:-1] = (d[:, :, 2:] - d[:, :, :-2]) / 2
+    gv[:, 1:-1, :] = (d[:, 2:, :] - d[:, :-2, :]) / 2
+    cx, cy = (w - 1) / 2, (h - 1) / 2
+    xn = ((torch.arange(w, device=d.device, dtype=d.dtype) - cx) / f).view(1, 1, w)
+    yn = ((torch.arange(h, device=d.device, dtype=d.dtype) - cy) / f).view(1, h, 1)
+    nr = N[..., 0] * xn - N[..., 1] * yn - N[..., 2]
+    au, av = N[..., 0] / (f * nr), -N[..., 1] / (f * nr)          # expected slope of the depth pass x R
+    a2 = au * au + av * av
+    g = (gu * gu + gv * gv).sqrt()
+    ok = (nr < -0.15) & (N[..., 0].abs() + N[..., 1].abs() > 0.35) & (g > 1e-4) & (d > 0.02) & (d < 0.98)
+    if int(ok.sum()) > 200:
+        gq = torch.quantile(g[ok][:: max(1, int(ok.sum()) // 200000)], 0.9)
+        ok = ok & (g < gq)                                       # silhouettes: depth jumps, not slopes
+    if int(ok.sum()) < 200:
+        return DEFAULT_LOG_RANGE, 0
+    k = (gu * au + gv * av) / a2.clamp_min(1e-12)                # = 1/R per pixel
+    k = k[ok]
+    k = k[torch.isfinite(k)]
+    km = float(k.median()) if k.numel() else 0.0
+    if km <= 0:
+        return DEFAULT_LOG_RANGE, int(ok.sum())
+    return float(min(8.0, max(0.5, 1.0 / km))), int(ok.sum())
+
+
+def cast_shadow(depth, L, hardness, log_range, f, steps=None, reach=None):
+    """Screen-space shadows marched in perspective: from every pixel a ray toward the sun, followed in the image (it
+    heads for the sun's vanishing point when the sun is beyond the scene, away from the antisolar point when it's
+    behind the camera, straight across for a side sun) with its distance tracked (log depth = -log_range x depth pass).
+    A surface blocks the ray where it stands in front of the ray point by more than a bias and less than a thickness
+    (things far in front of it, like a nearby object over a distant wall, don't). Occluders fade toward the end of the
+    reach and the clipped far end of the depth pass never blocks (its real distance is unknown); the map is blurred by
+    a penumbra that widens as the look gets softer. depth (N,H,W) = clip-normalised log
+    disparity, near = 1. Returns (N,H,W) in [0, 1], 1 = lit."""
+    n, h, w = depth.shape
+    steps = steps or SHADOW_STEPS
+    reach = reach or SHADOW_REACH
     lx, ly, lz = L
-    lxy = math.hypot(lx, ly)
-    if lxy < 1e-3:                                   # light straight from the camera or straight behind: no screen shadow
-        return torch.ones_like(height)
+    dev, dt = depth.device, depth.dtype
+    logd = -log_range * depth
+    flat = logd.reshape(n, -1)
+    far_end = -log_range * SKY_DEPTH                  # the clipped far end of the depth pass: its distance is unknown
+    cx, cy = (w - 1) / 2, (h - 1) / 2
+    py = torch.arange(h, device=dev, dtype=dt).view(1, h, 1).expand(n, h, w).clone()
+    px = torch.arange(w, device=dev, dtype=dt).view(1, 1, w).expand(n, h, w).clone()
+    lray = logd.clone()
+    active = torch.ones_like(depth, dtype=torch.bool)
+    lit = torch.ones_like(depth)
     step = max(1.0, reach * w / steps)
-    dx, dy = lx / lxy * step, -ly / lxy * step       # image y runs down
-    dz = max(0.0, lz / lxy * step)                   # ray height gained per step (light on the camera side only)
-    dev = height.device
-    ys = torch.arange(h, device=dev, dtype=height.dtype).view(1, h, 1).expand(n, h, w)
-    xs = torch.arange(w, device=dev, dtype=height.dtype).view(1, 1, w).expand(n, h, w)
-    flat = height.reshape(n, -1)
-    lit = torch.ones_like(height)
-    bias = 0.006 * w
     for t in range(1, steps + 1):
-        x, y = xs + dx * t, ys + dy * t
-        inside = (x >= 0) & (x <= w - 1) & (y >= 0) & (y <= h - 1)
-        idx = (y.clamp(0, h - 1).round().long() * w + x.clamp(0, w - 1).round().long()).reshape(n, -1)
+        du = lx + lz * (px - cx) / f                  # image motion of the ray toward the sun (perspective)
+        dv = -ly + lz * (py - cy) / f
+        m = torch.sqrt(du * du + dv * dv)
+        active = active & (m > 0.02)                  # reached the sun's vanishing point
+        mm = m.clamp_min(0.02)
+        px = px + step * du / mm
+        py = py + step * dv / mm
+        k = 1 - lz * step / (f * mm)                  # distance factor per step (toward the camera when lz > 0)
+        active = active & (k > 0.05)
+        lray = lray + torch.log(k.clamp_min(0.05))
+        inside = (px >= 0) & (px <= w - 1) & (py >= 0) & (py <= h - 1)
+        idx = (py.clamp(0, h - 1).round().long() * w + px.clamp(0, w - 1).round().long()).reshape(n, -1)
         sample = torch.gather(flat, 1, idx).reshape(n, h, w)
-        blocked = inside & (sample > height + bias) & (sample > height + dz * t + bias)
-        fade = min(1.0, max(0.0, (t / steps - 0.6) / 0.4))   # occluders near the end of the reach count less
+        gap = lray - sample                           # > 0: the surface here is in front of the ray point
+        blocked = active & inside & (gap > SHADOW_BIAS) & (gap < SHADOW_THICKNESS) & (sample < far_end)
+        fade = min(1.0, max(0.0, (t / steps - 0.75) / 0.25))
         lit = torch.where(blocked, torch.minimum(lit, torch.full_like(lit, fade)), lit)
     return _gauss(lit, max(0.5, 0.15 * w / hardness)).clamp(0, 1)
 
@@ -121,16 +183,19 @@ def _guided_log_ratio(guide, num, den, r, eps=1e-3):
     return torch.exp(_box(a, r) * guide + _box(b, r))
 
 
-def new_light(normal, depth, L, look, proc_w):
-    """(N,H,W,3) linear light from the look's sun + hemisphere fill, with cast shadows; and the sun-only term."""
+def new_light(normal, depth, L, look, proc_w, log_range=None):
+    """(N,H,W,3) linear light from the look's sun + hemisphere fill, with cast shadows; and the shadow map.
+    log_range: the depth pass's log scale (depth_log_range); estimated from these frames when not given."""
     N = normal * 2 - 1
     N = N / N.norm(dim=-1, keepdim=True).clamp_min(1e-6)
     Lt = torch.tensor(L, dtype=N.dtype, device=N.device)
     ndl = (N * Lt).sum(-1)
     wrap = look["wrap"]
     ndl = ((ndl + wrap) / (1 + wrap)).clamp(0, 1)
-    height = depth * (0.30 * proc_w)                 # relative depth -> pixels toward the camera
-    sh = cast_shadow(height, L, look["hardness"])
+    f = focal_px(proc_w)
+    if log_range is None:
+        log_range = depth_log_range(normal, depth, f)[0]
+    sh = cast_shadow(depth, L, look["hardness"], log_range, f)
     sh = 1 - look["shadow"] * (1 - sh)
     up = ((N[..., 1] + 1) / 2)[..., None]            # hemisphere fill: sky from above, bounce from below
     t = lambda c: torch.tensor(c, dtype=N.dtype, device=N.device)  # noqa: E731
@@ -265,6 +330,7 @@ class AutoMatteRelightFromPasses:
         old_tint = old_tint / (old_tint * torch.tensor([0.2126, 0.7152, 0.0722], device=dev)).sum().clamp_min(1e-4)
         y_med = math.log(float(_luma(s_lin).median().clamp_min(1e-4)))
         sky_gain = torch.tensor(look["sky_tint"], device=dev) / old_tint
+        log_range, lr_px = depth_log_range(small(normal[idx]).to(dev), d_s, focal_px(pw))
 
         def sky_weight(dep, ylog):
             """Sky = the far end of the depth pass AND brighter than the clip's median (a dim far wall at the end of the
@@ -281,7 +347,7 @@ class AutoMatteRelightFromPasses:
             sl = slice(i, i + CHUNK)
             src, alb = _lin(small(images[sl]).to(dev)), _lin(small(base_color[sl]).to(dev))
             nrm, dep = small(normal[sl]).to(dev), small(depth[sl], 1)[..., 0].to(dev)
-            light, sh = new_light(nrm, dep, L, look, pw)
+            light, sh = new_light(nrm, dep, L, look, pw, log_range)
             shot = _guided_log_ratio(dep, _luma(src), _luma(alb), r_g).clamp(0.05, 8)
             ylog = torch.log(_gauss(_luma(src), 1.0).clamp_min(1e-4))
             sky = sky_weight(dep, ylog)
@@ -334,6 +400,7 @@ class AutoMatteRelightFromPasses:
                "light_vector": [round(v, 3) for v in L], "processing_size": [pw, ph],
                "old_light_tint": [round(float(v), 3) for v in old_tint], "exposure_gain": round(k_exp, 3),
                "shadow_share": round(float((shadow < 0.5).float().mean()), 3),
+               "depth_log_range": round(log_range, 2), "depth_log_range_pixels": lr_px,
                "sky_share": round(float((shade[..., 2] > 0.5).float().mean()), 3),
                "structure_lock_mean": round(float(lk_t.mean()), 3), "structure_lock_min": round(float(lk_t.min()), 3),
                "strength": strength, "temporal_smoothing": temporal_smoothing,
