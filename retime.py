@@ -29,7 +29,7 @@ import re
 import torch
 import torch.nn.functional as F
 
-from .nodes import _device, CHUNK
+from .nodes import _device, chunk_frames, make_room
 from .layers import _fit_mask, _box, srgb_to_ok
 
 MODES = ["Whole Clip", "Subject Only", "Background Only", "Hero Freeze"]
@@ -227,8 +227,9 @@ def _thumbs(images, short=96):
     s = short / min(h, w)
     th, tw = max(8, round(h * s)), max(8, round(w * s))
     dev, out = _device(), []
-    for i in range(0, n, CHUNK * 4):
-        x = images[i:i + CHUNK * 4]
+    step = 4 * chunk_frames(images.shape[1], images.shape[2])     # grey frames: 4 chunks' worth (32 at HD, 4 at 4K)
+    for i in range(0, n, step):
+        x = images[i:i + step]
         x = x[..., :3].mean(-1) if x.dim() == 4 else x
         out.append(F.interpolate(x.to(dev).float()[:, None], size=(th, tw), mode="area")[:, 0].cpu())
     return torch.cat(out, 0)
@@ -454,12 +455,15 @@ class _Interp:
         self.made = 0
 
     def load(self, h, w):
+        """Load the model for frames of h x w and size the timesteps per pass by pixels (8 at HD, 1 at 4K: RIFE needs
+        roughly 300 floats per pixel per timestep). FILM runs its timesteps one after another anyway."""
         if self._loaded == (h, w):
             return
+        self.batch = chunk_frames(h, w)
         try:
             import comfy.model_management as mm
             mem = self.net.memory_used_forward((1, h, w, 3), self.dtype) if hasattr(self.net, "memory_used_forward") else 0
-            mm.load_models_gpu([self.patcher], memory_required=mem)
+            mm.load_models_gpu([self.patcher], memory_required=mem * (1 if self.film else self.batch))
         except Exception:
             if hasattr(self.net, "to"):
                 self.net.to(self.device)
@@ -957,8 +961,9 @@ def hero_freeze_frame(images, matte, given=None):
         lo, hi = max(0, given - 3), min(n - 1, given + 3)
     idx = list(range(lo, hi + 1)) or [n // 2]
     sharp, area = [], []
-    for c in range(0, len(idx), CHUNK * 2):
-        s, a = _sharpness(images, matte, idx[c:c + CHUNK * 2])
+    step = 2 * chunk_frames(images.shape[1], images.shape[2])
+    for c in range(0, len(idx), step):
+        s, a = _sharpness(images, matte, idx[c:c + step])
         sharp.append(s)
         area.append(a)
     sharp, area = torch.cat(sharp), torch.cat(area)
@@ -1426,9 +1431,10 @@ class AutoMatteRetime:
         r = max(1, round(0.003 * min(h, w)))
         dev = _device()
         core = torch.empty((n, h, w), dtype=torch.float32)
-        for i in range(0, n, CHUNK):
-            c = _dil((m[i:i + CHUNK].to(dev) > 0.02).float(), r)
-            core[i:i + CHUNK] = _box(c, 1).clamp(0, 1).cpu() if min(h, w) > 4 else c.cpu()
+        ck = chunk_frames(h, w)
+        for i in range(0, n, ck):
+            c = _dil((m[i:i + ck].to(dev) > 0.02).float(), r)
+            core[i:i + ck] = _box(c, 1).clamp(0, 1).cpu() if min(h, w) > 4 else c.cpu()
         info = {}
         try:
             from .effects import AutoMatteEffectZone, AutoMatteEffectMask
@@ -1452,9 +1458,11 @@ class AutoMatteRetime:
         S, info = self._support(images, m, P)
         rep.update(info)
         B = torch.empty_like(images[..., :3], dtype=torch.float32)
-        for i in range(0, n, CHUNK):
-            s = S[i:i + CHUNK].to(dev)[..., None]
-            B[i:i + CHUNK] = (s * P[i:i + CHUNK].to(dev) + (1 - s) * images[i:i + CHUNK, ..., :3].to(dev).float()).cpu()
+        ck = chunk_frames(h, w)
+        make_room(dev, ck * h * w)
+        for i in range(0, n, ck):
+            s = S[i:i + ck].to(dev)[..., None]
+            B[i:i + ck] = (s * P[i:i + ck].to(dev) + (1 - s) * images[i:i + ck, ..., :3].to(dev).float()).cpu()
         # camera and lock
         cam = _Camera(B, support=S)
         cam.set_subject(m)
