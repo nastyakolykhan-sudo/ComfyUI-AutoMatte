@@ -34,9 +34,9 @@ try:                       # OpenCV (a pack requirement) gives optical flow; wit
 except Exception:          # noqa: BLE001
     cv2 = None
 
-from .nodes import _device, _resize_frames, CHUNK
+from .nodes import _device
 from .layers import _box, _fit_mask
-from .relight import _lin, _srgb, _luma, _gauss, _key, structure_lock
+from .relight import _lin, _srgb, _luma, _gauss, _key, structure_lock, _resize_in_chunks, chunk_frames, make_room
 
 # Look -> light. sun / sky / ground colours are linear RGB multipliers; wrap softens the terminator (0 = hard);
 # hardness sets the shadow penumbra (high = crisp); shadow = how dark full shadow gets (1 = only fill remains);
@@ -379,7 +379,7 @@ class AutoMatteRelightFromPasses:
 
         def small(x, c=3):
             x = x[..., :c].float()
-            return _resize_frames(x, ph, pw, "bilinear") if x.shape[1:3] != (ph, pw) else x
+            return _resize_in_chunks(x, ph, pw, "bilinear")
 
         # clip constants: the source's light colour (divided out, so the old tint doesn't stay) and median brightness
         idx = torch.linspace(0, n - 1, min(n, 16)).round().long().unique()
@@ -417,8 +417,9 @@ class AutoMatteRelightFromPasses:
         # along depth edges), the sky weight, the source's log luminance (temporal weights), new light and shadow
         r_g = max(3, round(SHOT_RADIUS * pw))
         gains, ysrcs, shades = [], [], []
-        for i in range(0, n, CHUNK):
-            sl = slice(i, i + CHUNK)
+        cf = chunk_frames(h, w)                       # the frames come in at full size: one at a time at 4K
+        for i in range(0, n, cf):
+            sl = slice(i, i + cf)
             src, alb = _lin(small(images[sl]).to(dev)), _lin(small(base_color[sl]).to(dev))
             nrm, dep = small(normal[sl]).to(dev), small(depth[sl], 1)[..., 0].to(dev)
             floor = _far_floor(dep)
@@ -482,8 +483,9 @@ class AutoMatteRelightFromPasses:
             lgain = steady_over_time(n, lambda t: log_gain(torch.tensor([t]))[0], ysrc, sm, STEADY_SIGMA, dev)
         res = torch.empty(n, h, w, 3)                  # filled in place: no second full-size copy at 4K
         lock, light_out = [], []
-        for i in range(0, n, CHUNK):
-            j = torch.arange(i, min(i + CHUNK, n))
+        make_room(dev, cf * h * w)
+        for i in range(0, n, cf):
+            j = torch.arange(i, min(i + cf, n))
             lg = lgain[j].float().to(dev) if sm > 0 else log_gain(j)
             g = torch.exp(lg * float(strength))
             src = images[j, ..., :3].to(dev).float()

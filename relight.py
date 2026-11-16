@@ -27,6 +27,14 @@ import torch
 import torch.nn.functional as F
 
 from .nodes import _device, _resize_frames, CHUNK
+try:                                  # frames per GPU chunk by pixels (8 at HD, 1 at 4K) and room for them
+    from .nodes import chunk_frames, make_room
+except ImportError:                   # an older nodes.py
+    def chunk_frames(h, w):
+        return max(1, min(CHUNK, (8 * 1920 * 1088) // max(1, h * w)))
+
+    def make_room(dev, px, floats_per_px=40):
+        return None
 from .layers import _video_given, _fit_mask, srgb_to_ok, ok_to_srgb
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -83,6 +91,14 @@ NIGHT_CAP = (1920, 1088)         # Lightricks' 2.5 ladder stage 1 (FullHD, one s
 BALL_FRAC, MARGIN_FRAC = 143 / 704, 22 / 704   # ball patch and margin as a share of the canvas's short side
 _DAY_WORDS = r"\b(sunny|sunlit|sun-drenched|sunlight|sunshine|daylight|daytime|bright|midday|morning|afternoon|" \
              r"blue sky|clear sky|golden hour|sunset|sunrise)\b"
+
+
+def _resize_in_chunks(x, h, w, mode):
+    """_resize_frames with at most chunk_frames(source size) frames on the GPU at a time (one frame at 4K)."""
+    if x.shape[1] == h and x.shape[2] == w:
+        return x
+    cf = chunk_frames(x.shape[1], x.shape[2])
+    return torch.cat([_resize_frames(x[i:i + cf], h, w, mode) for i in range(0, x.shape[0], cf)], 0)
 
 
 def _ceil(v, m):
@@ -355,7 +371,7 @@ class AutoMatteRelightGuide:
     def run(self, images, plan):
         n = images.shape[0]
         cw, ch, W, H, strip = plan["content_w"], plan["content_h"], plan["canvas_w"], plan["canvas_h"], plan["strip_w"]
-        x = _resize_frames(images[..., :3], ch, cw, "bicubic").clamp(0, 1)
+        x = _resize_in_chunks(images[..., :3], ch, cw, "bicubic").clamp(0, 1)
         x = _pad_right_bottom(x, W - cw, H - ch)
         if strip:
             x = _pad_right_bottom(x, strip, 0)
@@ -554,15 +570,17 @@ class AutoMatteRelightRestore:
         if night and plan.get("night_floor"):
             nf = night_floor_stats(images, rel, plan["night_floor"]["ratio"], plan["night_floor"]["b_max"])
         dev, out, lock = _device(), [], []
-        for i in range(0, n, CHUNK):
-            s = images[i:i + CHUNK, ..., :3].to(dev).float()
-            r = _resize_frames(rel[i:i + CHUNK], h, w, "bicubic").to(dev).float().clamp(0, 1)
+        cf = chunk_frames(h, w)                       # full-size frames: one at a time at 4K
+        make_room(dev, cf * h * w)
+        for i in range(0, n, cf):
+            s = images[i:i + cf, ..., :3].to(dev).float()
+            r = _resize_frames(rel[i:i + cf], h, w, "bicubic").to(dev).float().clamp(0, 1)
             r = apply_night_floor(s, r, nf)
             s_lin, r_lin = _lin(s), _lin(r)
             ys, yr = _luma(s_lin), _luma(r_lin)
             yo = yr if sig_g == 0 else _gauss(yr, sig_g) * _detail_ratio(ys, sig_g, 0.25, 4.0, night)
             if m is not None:
-                mc = m[i:i + CHUNK].to(dev).float()
+                mc = m[i:i + cf].to(dev).float()
                 inner = -F.max_pool2d(-mc[:, None], 3, stride=1, padding=1)[:, 0]          # 1 px in from the edge
                 inner = F.avg_pool2d(inner[:, None], 3, stride=1, padding=1, count_include_pad=False)[:, 0]
                 ys_sub = _gauss(yr, sig_s) * _detail_ratio(ys, sig_s, 0.02, 10.0, night)  # black print on white: ~0.05
