@@ -15,7 +15,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-from .nodes import _device, CHUNK
+from .nodes import _device, _resize_frames, CHUNK
 from .layers import srgb_to_ok, ok_to_srgb, _fit_mask, _box
 
 
@@ -25,6 +25,24 @@ def _lin(c):
 
 def _srgb(c):
     return torch.where(c <= 0.0031308, 12.92 * c, 1.055 * c.clamp_min(0) ** (1 / 2.4) - 0.055).clamp(0, 1)
+
+
+def _mask_chunk(matte, i, j, h, w):
+    """Frames i..j-1 of a matte as (j-i, h, w) in [0, 1]: resized to the frame, padded with its last frame or cut
+    (as _fit_mask, one chunk at a time, so no full-clip copy is made)."""
+    idx = torch.arange(i, j).clamp(max=matte.shape[0] - 1)
+    m = matte[idx].float()
+    if m.shape[1:] != (h, w):
+        m = _resize_frames(m[..., None], h, w, "bilinear")[..., 0]
+    return m.clamp(0, 1)
+
+
+def _progress(steps):
+    try:
+        import comfy.utils
+        return comfy.utils.ProgressBar(steps)
+    except Exception:  # unit tests outside ComfyUI
+        return None
 
 
 class AutoMatteLayerGrade:
@@ -53,44 +71,64 @@ class AutoMatteLayerGrade:
     CATEGORY = "AutoMatte/Layers"
 
     def run(self, images, matte, target="Subject", exposure=0.0, contrast=0.0, saturation=0.0, warmth=0.0):
+        # Chunk by chunk with no full-clip mask copies (a 4K clip is ~8 GB of frames already), one OKLab conversion
+        # per frame, statistics from a strided pixel sample, and progress per chunk (a silent node on a long 4K clip
+        # looks stalled to a job watchdog).
         n, h, w = images.shape[0], images.shape[1], images.shape[2]
-        m = _fit_mask(matte, n, h, w)
-        if str(target).lower().startswith("back"):
-            m = 1 - m
+        back = str(target).lower().startswith("back")
+        rep = {"edit": "layer_grade", "target": target, "exposure_stops": exposure, "contrast": contrast,
+               "saturation": saturation, "warmth": warmth}
+        if not (exposure or contrast or saturation or warmth):
+            rep["notes"] = ["All grade values are 0: the clip is returned unchanged"]
+            return (images, json.dumps(rep))
         dev = _device()
-        # the layer's median lightness over the clip (contrast pivot)
+        s = 4 if min(h, w) >= 512 else 1  # statistics stride
+        chunks = [(i, min(n, i + CHUNK)) for i in range(0, n, CHUNK)]
+        pbar = _progress(2 * len(chunks))
+
+        def layer(i, j):
+            m = _mask_chunk(matte, i, j, h, w).to(dev)
+            return 1 - m if back else m
+
+        # the layer's median lightness over the whole clip (contrast pivot), from a strided sample
         samples = []
-        for i in range(0, n, CHUNK):
-            mm = m[i:i + CHUNK].to(dev)
-            if bool((mm > 0.5).any()):
-                L = srgb_to_ok(images[i:i + CHUNK, ..., :3].to(dev).float())[..., 0][mm > 0.5]
+        for i, j in chunks:
+            sel = layer(i, j)[:, ::s, ::s] > 0.5
+            if bool(sel.any()):
+                L = srgb_to_ok(images[i:j, ::s, ::s, :3].to(dev).float())[..., 0][sel]
                 samples.append(L[torch.linspace(0, L.numel() - 1, min(L.numel(), 50000), device=dev).long()].cpu())
+            if pbar:
+                pbar.update(1)
         pivot = float(torch.cat(samples).median()) if samples else 50.0
         gain = 2.0 ** exposure
         k_con = 1.0 + contrast
         k_sat = max(0.0, 1.0 + saturation)
         out = images.clone()
         lsum = [0.0, 0.0, 0]
-        for i in range(0, n, CHUNK):
-            mm = m[i:i + CHUNK].to(dev)[..., None]
-            if not bool((mm > 0).any()):
-                continue
-            rgb = images[i:i + CHUNK, ..., :3].to(dev).float()
-            x = _srgb(_lin(rgb) * gain) if exposure else rgb
-            ok = srgb_to_ok(x)
-            L = pivot + (ok[..., 0] - pivot) * k_con
-            a = ok[..., 1] * k_sat + 2.0 * warmth
-            b = ok[..., 2] * k_sat + 10.0 * warmth
-            new = ok_to_srgb(torch.stack([L.clamp(0, 100), a, b], -1))
-            res = torch.where(mm > 0, rgb + (new - rgb) * mm, rgb)
-            out[i:i + CHUNK, ..., :3] = res.to(out.dtype).cpu()
-            sel = mm[..., 0] > 0.5
-            if bool(sel.any()):
-                lsum[0] += float(srgb_to_ok(rgb)[..., 0][sel].mean())
-                lsum[1] += float(srgb_to_ok(res)[..., 0][sel].mean())
-                lsum[2] += 1
-        rep = {"edit": "layer_grade", "target": target, "exposure_stops": exposure, "contrast": contrast,
-               "saturation": saturation, "warmth": warmth, "contrast_pivot_L": round(pivot, 1)}
+        for i, j in chunks:
+            mm = layer(i, j)[..., None]
+            if bool((mm > 0).any()):
+                rgb = images[i:j, ..., :3].to(dev).float()
+                x = _srgb(_lin(rgb) * gain) if exposure else rgb
+                ok = srgb_to_ok(x)
+                L = pivot + (ok[..., 0] - pivot) * k_con
+                a = ok[..., 1] * k_sat + 2.0 * warmth
+                b = ok[..., 2] * k_sat + 10.0 * warmth
+                del ok, x
+                new = ok_to_srgb(torch.stack([L.clamp(0, 100), a, b], -1))
+                del L, a, b
+                res = torch.where(mm > 0, rgb + (new - rgb) * mm, rgb)
+                del new
+                out[i:j, ..., :3] = res.to(out.dtype).cpu()
+                sel = mm[:, ::s, ::s, 0] > 0.5
+                if bool(sel.any()):
+                    lsum[0] += float(srgb_to_ok(rgb[:, ::s, ::s])[..., 0][sel].mean())
+                    lsum[1] += float(srgb_to_ok(res[:, ::s, ::s])[..., 0][sel].mean())
+                    lsum[2] += 1
+                del rgb, res
+            if pbar:
+                pbar.update(1)
+        rep["contrast_pivot_L"] = round(pivot, 1)
         if lsum[2]:
             rep.update(layer_lightness_before=round(lsum[0] / lsum[2], 1), layer_lightness_after=round(lsum[1] / lsum[2], 1))
         return (out, json.dumps(rep))
