@@ -37,6 +37,25 @@ def _mask_chunk(matte, i, j, h, w):
     return m.clamp(0, 1)
 
 
+GPU_CHUNK_PX = 8 * 1920 * 1088  # pixels per GPU chunk: 8 HD frames, 1 frame of 4K
+
+
+def _chunk_frames(h, w):
+    """Frames per GPU chunk, by pixels: CHUNK frames at HD, fewer at higher resolutions (8 frames of 4K stalled the
+    node on a worker that still held the matte models in GPU memory)."""
+    return max(1, min(CHUNK, GPU_CHUNK_PX // max(1, h * w)))
+
+
+def _make_room(dev, px):
+    """Ask ComfyUI to unload cached models until a chunk of `px` pixels has room (~40 float32 values per pixel at
+    the peak of a grade)."""
+    try:
+        import comfy.model_management as mm
+        mm.free_memory(px * 160, dev)
+    except Exception:  # unit tests outside ComfyUI
+        pass
+
+
 def _progress(steps):
     try:
         import comfy.utils
@@ -71,9 +90,9 @@ class AutoMatteLayerGrade:
     CATEGORY = "AutoMatte/Layers"
 
     def run(self, images, matte, target="Subject", exposure=0.0, contrast=0.0, saturation=0.0, warmth=0.0):
-        # Chunk by chunk with no full-clip mask copies (a 4K clip is ~8 GB of frames already), one OKLab conversion
-        # per frame, statistics from a strided pixel sample, and progress per chunk (a silent node on a long 4K clip
-        # looks stalled to a job watchdog).
+        # GPU chunks sized by pixels (1 frame at 4K) after asking ComfyUI to unload cached models, masks fitted per
+        # chunk (no full-clip copies), one OKLab conversion per frame, statistics from a strided pixel sample, and
+        # progress per chunk.
         n, h, w = images.shape[0], images.shape[1], images.shape[2]
         back = str(target).lower().startswith("back")
         rep = {"edit": "layer_grade", "target": target, "exposure_stops": exposure, "contrast": contrast,
@@ -83,7 +102,9 @@ class AutoMatteLayerGrade:
             return (images, json.dumps(rep))
         dev = _device()
         s = 4 if min(h, w) >= 512 else 1  # statistics stride
-        chunks = [(i, min(n, i + CHUNK)) for i in range(0, n, CHUNK)]
+        k = _chunk_frames(h, w)
+        _make_room(dev, k * h * w)
+        chunks = [(i, min(n, i + k)) for i in range(0, n, k)]
         pbar = _progress(2 * len(chunks))
 
         def layer(i, j):
